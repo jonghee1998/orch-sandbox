@@ -238,11 +238,11 @@ async function evaluatePR(prNumber, { reviewRunFailed = false } = {}) {
 
   if (d.action === "wait") return { run, pr, codex, fallback: review !== codex };
   if (d.action === "block") return block(run, d.reason, codex.url ?? pr.html_url, "review");
-  if (d.action === "pass") return onPass(run, pr);
+  if (d.action === "pass") return onPass(run, pr, review.source === "claude" ? "Claude(Opus) 대체 검수 PASS" : "Codex 지적 없음");
   return onFail(run, pr, d.reason);
 }
 
-async function onPass(run, pr) {
+async function onPass(run, pr, reviewNote = "Codex 지적 없음") {
   const st = run.state;
   const step = run.plan.steps.find((s) => s.id === st.step);
   try {
@@ -259,7 +259,7 @@ async function onPass(run, pr) {
 
   if (step.id < total) {
     await save(run, { status: "implementing", step: step.id + 1, attempt: 1, retries: 0, pr: null, passed, requestedAt: now() },
-      `✅ Step ${step.id} 통과 (#${pr.number}, Codex 지적 없음 + CI 통과) → Step ${step.id + 1} 구현 시작`);
+      `✅ Step ${step.id} 통과 (#${pr.number}, ${reviewNote} + CI 통과) → Step ${step.id + 1} 구현 시작`);
     await dispatchWork(run, "implement");
     return;
   }
@@ -389,6 +389,9 @@ async function onEvent() {
     return;
   }
 
+  if (name === "workflow_dispatch" && /^\d+$/.test(env.INPUT_PR ?? "")) {
+    return evaluatePR(Number(env.INPUT_PR), { reviewRunFailed: true });
+  }
   if (name === "schedule" || name === "workflow_dispatch") return watchdog();
 }
 

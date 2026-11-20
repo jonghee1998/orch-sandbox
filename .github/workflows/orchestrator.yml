@@ -13,6 +13,11 @@ on:
   schedule:
     - cron: "*/20 * * * *"            # watchdog: missed events, Codex nudge, idle timeout, final merge
   workflow_dispatch:
+    inputs:
+      pr:
+        description: "평가할 PR 번호 (비우면 전체 watchdog)"
+        required: false
+        type: string
 
 permissions: {}
 
@@ -57,3 +62,4 @@ jobs:
           BOT_PAT: ${{ secrets.BOT_PAT }}
           READ_TOKEN: ${{ github.token }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          INPUT_PR: ${{ inputs.pr }}

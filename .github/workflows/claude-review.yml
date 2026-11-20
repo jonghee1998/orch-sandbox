@@ -22,6 +22,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write   # commenting on a PR (issues API) needs this
+      actions: write         # wake the orchestrator (workflow_run chains are depth-limited)
       id-token: write
     steps:
       - name: PR commit under review
@@ -75,3 +76,9 @@ jobs:
           PR: ${{ inputs.pr }}
           SHA: ${{ inputs.sha }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+      - name: Wake the orchestrator for this PR
+        if: always() && steps.prep.outputs.skip != 'true'
+        run: gh workflow run orchestrator.yml --ref main -f pr="$PR" -R "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
