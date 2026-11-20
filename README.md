@@ -47,6 +47,8 @@ orch:go ─▶ Claude 구현 (orch/run-N-step-K) ─▶ PR → orch/run-N
 - **FAIL**: Codex 미해결 지적이 있거나 CI 실패 → Claude에게 수정 요청 (`max_retries` 기본 2회).
 - **중단**: 수정 한도 초과, Claude가 `.orch/BLOCKED.md` 보고, 변경 없음, Codex 리뷰 실패(사용량 한도), 응답 없음(구현 75분 / 검증 120분).
 
+**구현 모델 선택** (스텝마다): `steps[].model` → 계획의 `model` → 자동 순으로 정합니다. 자동이면 스텝 제목·내용에 DB·인증·결제·권한·보안·배포 관련 말이 있을 때 Opus, 아니면 Sonnet을 씁니다. Sonnet으로 검수에 2번 실패한 스텝은 다음 수정부터 Opus로 올립니다. 완공 보고서의 '검사 결과' 표에 스텝별 구현 모델이 나옵니다.
+
 **Codex를 쓸 수 없을 때** (리뷰 status=`failed`, 예: 사용량 한도): `claude-review` 워크플로가 Claude **Opus**로 같은 커밋을 독립 검수합니다. 구현 세션과 분리된 새 세션이고 읽기 전용입니다. 판정 댓글은 `github-actions[bot]`이 쓴 것만 믿으며, 구현 job은 이 계정으로 댓글을 쓸 수 없습니다. head마다 한 번만 요청합니다.
 
 Codex 판정은 `chatgpt-codex-connector[bot]`(id 199175422, type Bot)가 쓴 마커만 믿고, 커밋 SHA가 현재 head와 같아야 합니다. 이전 커밋에 대한 PASS는 무시합니다.

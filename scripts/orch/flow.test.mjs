@@ -225,7 +225,7 @@ test("happy path with one fix round: start -> PR -> FAIL -> fix -> PASS -> next 
   assert.equal(final.head.ref, C.runBranch(n));
   assert.match(final.body, /완공 보고서/);
   assert.match(final.body, /위험 낮음/);
-  assert.match(final.body, /\| 1\. 스텝1 \| Codex \| 1회 \|/, "step 1 needed one fix");
+  assert.match(final.body, /\| 1\. 스텝1 \| sonnet \| Codex \| 1회 \|/, "step 1 needed one fix");
   assert.match(db.issues[n].body, /- \[x\] Step 2\. 스텝2 — 통과/);
 
   // CI still running on the final PR -> wait

@@ -43,6 +43,7 @@ export function parsePlan(body) {
 
 const isStr = (v) => typeof v === "string" && v.trim().length > 0;
 const isStrArr = (v) => Array.isArray(v) && v.every(isStr);
+const isModel = (v) => typeof v === "string" && /^[a-z0-9][a-z0-9.\-]{0,63}$/.test(v);
 
 export function validatePlan(p) {
   const err = (e) => ({ ok: false, error: e });
@@ -62,8 +63,9 @@ export function validatePlan(p) {
   }
   const maxRetries = p.max_retries ?? DEFAULT_MAX_RETRIES;
   if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 3) return err("max_retries는 0~3 정수입니다.");
-  if (p.model !== undefined && !(typeof p.model === "string" && /^[a-z0-9][a-z0-9.\-]{0,63}$/.test(p.model))) {
-    return err("model 형식이 올바르지 않습니다.");
+  if (p.model !== undefined && !isModel(p.model)) return err("model 형식이 올바르지 않습니다.");
+  for (const [i, s] of p.steps.entries()) {
+    if (s.model !== undefined && !isModel(s.model)) return err(`steps[${i}].model 형식이 올바르지 않습니다.`);
   }
   if (p.auto_merge !== undefined && typeof p.auto_merge !== "boolean") return err("auto_merge는 true/false입니다.");
   if (p.try !== undefined && !(typeof p.try === "string" && p.try.length <= 2000)) return err("try는 2000자 이내 문자열입니다.");
@@ -82,9 +84,36 @@ export function validatePlan(p) {
         task: s.task.trim(),
         done_when: s.done_when.map((x) => x.trim()),
         stop_if: (s.stop_if ?? []).map((x) => x.trim()),
+        model: s.model ?? null,
       })),
     },
   };
+}
+
+// ---------------------------------------------------------------- model selection
+
+export const MODEL_LIGHT = "sonnet";
+export const MODEL_HEAVY = "opus";
+/** After this many failed reviews on one step, a light model is escalated to the heavy one. */
+export const ESCALATE_AFTER = 2;
+/** Step text that suggests risky work (DB, auth, payment, permissions, deploy) → heavy model by default. */
+const HEAVY_TEXT_RE = /(migration|schema|\bsql\b|database|\bdb\b|auth|login|session|password|token|oauth|payment|billing|permission|security|deploy|DB|데이터베이스|스키마|인증|로그인|비밀번호|결제|권한|보안|배포|마이그레이션)/i;
+
+/**
+ * Model for a step's implement/fix run.
+ * Priority: step.model > plan.model > auto (risky text → opus, else sonnet).
+ * A light model is escalated to opus once the step has failed review ESCALATE_AFTER times.
+ * @returns {{model: string, why: string}}
+ */
+export function pickModel(plan, stepId, retries = 0) {
+  const step = plan.steps.find((s) => s.id === stepId) ?? {};
+  let model, why;
+  if (step.model) [model, why] = [step.model, "스텝 지정"];
+  else if (plan.model) [model, why] = [plan.model, "계획 지정"];
+  else if (HEAVY_TEXT_RE.test(`${step.title ?? ""}\n${step.task ?? ""}`)) [model, why] = [MODEL_HEAVY, "자동(위험 작업)"];
+  else [model, why] = [MODEL_LIGHT, "자동(일반 작업)"];
+  if (retries >= ESCALATE_AFTER && /sonnet|haiku/i.test(model)) [model, why] = [MODEL_HEAVY, `검수 ${retries}회 실패로 상향`];
+  return { model, why };
 }
 
 // ---------------------------------------------------------------- state marker + board
@@ -401,7 +430,7 @@ export function finalReport({ n, plan, steps, risk, autoMerge }) {
   const howTo = plan.try
     ? plan.try
     : plan.steps.flatMap((s) => s.done_when).map((x) => `- ${x}`).join("\n");
-  const checks = steps.map((s) => `| ${s.id}. ${s.title} | ${s.reviewer} | ${s.retries}회 | #${s.pr} |`);
+  const checks = steps.map((s) => `| ${s.id}. ${s.title} | ${s.model ?? "-"} | ${s.reviewer} | ${s.retries}회 | #${s.pr} |`);
   const cautions = risk.reasons.length
     ? risk.reasons.map((r) => `- **${r.reason}**: ${r.detail}`).join("\n")
     : "- 없음 (DB·로그인·결제·권한·배포 설정·외부 패키지 변경 없음)";
@@ -419,8 +448,8 @@ export function finalReport({ n, plan, steps, risk, autoMerge }) {
     howTo,
     "",
     "### 검사 결과",
-    "| 스텝 | 검사 | 수정 | PR |",
-    "| --- | --- | --- | --- |",
+    "| 스텝 | 구현 모델 | 검사 | 수정 | PR |",
+    "| --- | --- | --- | --- | --- |",
     ...checks,
     "",
     "모든 스텝이 독립 검사와 CI(`npm test`)를 통과했습니다.",
