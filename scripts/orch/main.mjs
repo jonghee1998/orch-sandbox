@@ -445,7 +445,10 @@ async function commitAndPush() {
     setOutput("changed", "false");
     return;
   }
-  git("push", "origin", `HEAD:refs/heads/${branch}`);
+  // claude-code-action rewrites the checkout's git credentials, so push with an explicit token URL.
+  // (BOT_PAT is a registered secret, so Actions masks it in any log output.)
+  const url = env.BOT_PAT ? `https://x-access-token:${env.BOT_PAT}@github.com/${REPO}.git` : "origin";
+  git("push", url, `HEAD:refs/heads/${branch}`);
   setOutput("changed", "true");
 }
 

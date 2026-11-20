@@ -71,11 +71,20 @@ jobs:
         if: steps.prep.outputs.skip != 'true'
         run: node "$RUNNER_TEMP/orch/main.mjs" commit
         env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
           ISSUE: ${{ inputs.issue }}
           MODE: ${{ inputs.mode }}
           STEP: ${{ inputs.step }}
           BRANCH: ${{ steps.prep.outputs.branch }}
           START_SHA: ${{ steps.prep.outputs.start_sha }}
+      - name: Keep Claude transcript
+        if: always() && steps.prep.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-transcript-${{ inputs.issue }}-step${{ inputs.step }}-${{ inputs.mode }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/claude-execution-output.json
+          retention-days: 7
+          if-no-files-found: ignore
 
   publish:
     needs: work
