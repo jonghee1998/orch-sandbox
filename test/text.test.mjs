@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { wordCount, charCount } from "../src/text.mjs";
+import { wordCount, charCount, topWords } from "../src/text.mjs";
 
 test("wordCount", () => {
   assert.equal(wordCount(""), 0);
@@ -16,4 +16,22 @@ test("charCount", () => {
   assert.equal(charCount(undefined), 0);
   assert.equal(charCount(123), 0);
   assert.equal(charCount("한글😀"), 3);
+});
+
+test("topWords", () => {
+  assert.deepEqual(topWords("b a B, c a b", 2), [
+    { word: "b", count: 3 },
+    { word: "a", count: 2 },
+  ]);
+  // ties sorted alphabetically, default n = 3
+  assert.deepEqual(topWords("d c b a"), [
+    { word: "a", count: 1 },
+    { word: "b", count: 1 },
+    { word: "c", count: 1 },
+  ]);
+  assert.deepEqual(topWords(""), []);
+  assert.deepEqual(topWords("a b", 0), []);
+  assert.deepEqual(topWords("a b", -1), []);
+  assert.deepEqual(topWords("a b", 1.5), []);
+  assert.deepEqual(topWords(null), []);
 });
