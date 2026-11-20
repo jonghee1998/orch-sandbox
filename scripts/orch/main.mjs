@@ -265,7 +265,13 @@ async function onPass(run, pr, reviewer = "codex") {
       commit_title: `[run #${run.n}] Step ${step.id}: ${step.title} (#${pr.number})`,
     });
   } catch (e) {
-    return block(run, `스텝 PR 머지 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "work");
+    const again = await gh().get(`/pulls/${pr.number}`);
+    const fresh = (await loadRun(run.n)).state;
+    if (again.merged_at && fresh?.step !== st.step) return log(`PR #${pr.number} already merged and handled`);
+    if (!again.merged_at) {
+      return block(run, `스텝 PR 머지 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "work");
+    }
+    log(`PR #${pr.number} merged by a concurrent run; continuing`);
   }
   const passed = { ...(st.passed ?? {}), [step.id]: pr.number };
   const stepInfo = { ...(st.stepInfo ?? {}), [step.id]: { reviewer, retries: st.retries ?? 0 } };
@@ -349,7 +355,10 @@ async function evaluateFinal(pr, n) {
       commit_title: `[orch] ${run.plan.goal} (#${pr.number})`,
     });
   } catch (e) {
-    return block(run, `최종 PR 자동 머지 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "final");
+    const again = await gh().get(`/pulls/${pr.number}`);
+    if (!again.merged_at) {
+      return block(run, `최종 PR 자동 머지 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "final");
+    }
   }
   await finishRun(run, `🏁 최종 PR #${pr.number}을 자동 머지했습니다 (위험 낮음, CI 통과). 완료!`);
   await notify(`✅ Run #${run.n} 완료 (자동 머지)`, `${run.plan.goal}`, pr.html_url);
@@ -407,10 +416,19 @@ async function watchOne(n) {
     return;
   }
 
+  if (st.status === "implementing" && minutesSince(st.requestedAt) > 10) {
+    const busy = [
+      ...(await ro().all("/actions/workflows/claude-work.yml/runs?status=in_progress")),
+      ...(await ro().all("/actions/workflows/claude-work.yml/runs?status=queued")),
+    ].some((w) => (w.display_title ?? "").includes(`#${n} `));
+    if (!busy && (await recoverPushedWork(run))) return;
+  }
+
   if (["implementing", "fixing"].includes(st.status) && minutesSince(st.requestedAt) > WORK_IDLE_MIN) {
     const active = await ro().all("/actions/workflows/claude-work.yml/runs?status=in_progress");
     const queued = await ro().all("/actions/workflows/claude-work.yml/runs?status=queued");
     if ([...active, ...queued].some((w) => (w.display_title ?? "").includes(`#${n} `))) return;
+    if (await recoverPushedWork(run)) return;
     await block(run, `Claude 작업이 ${Math.round(minutesSince(st.requestedAt))}분째 결과가 없습니다.`, null, "work");
     return;
   }
@@ -470,6 +488,7 @@ async function onEvent() {
       const run = await loadRun(m[1]);
       const st = run?.state;
       if (st && ["implementing", "fixing"].includes(st.status) && Date.parse(wr.created_at) >= Date.parse(st.requestedAt) - 60000) {
+        if (await recoverPushedWork(run)) return;
         return block(run, `Claude 작업 워크플로가 ${wr.conclusion} 상태로 끝났습니다.`, wr.html_url, "work");
       }
       return;
@@ -595,6 +614,43 @@ async function resolveCodexThreads(prNumber) {
   return threads.length;
 }
 
+async function openStepPR(run, branch, summary, note = "") {
+  const step = run.state.step;
+  const step0 = run.plan.steps.find((s) => s.id === step);
+  const pr = await gh().post("/pulls", {
+    title: `[run #${run.n}] Step ${step}: ${step0.title}`,
+    head: branch,
+    base: C.runBranch(run.n),
+    body: C.prBody(run.n, run.plan, step, summary),
+  });
+  await save(run, { status: "reviewing", pr: pr.number, reviewRequestedAt: now(), nudged: [] },
+    `📝 Step ${step} PR #${pr.number}을 열었습니다${note}. Codex 리뷰와 CI를 기다립니다.`);
+  return pr;
+}
+
+/**
+ * Recovery for implement work that was pushed but never published (e.g. the publish job was lost).
+ * Returns true if a PR was opened (or already exists) for the current step branch.
+ */
+async function recoverPushedWork(run) {
+  const st = run.state;
+  if (st.status !== "implementing") return false;
+  const branch = C.stepBranch(run.n, st.step, st.attempt ?? 1);
+  const ref = await gh().get(`/git/ref/heads/${encodeURIComponent(branch)}`, { allow404: true });
+  if (!ref) return false;
+  const cmp = await gh().get(`/compare/${encodeURIComponent(C.runBranch(run.n))}...${encodeURIComponent(branch)}`);
+  if (!cmp.ahead_by) return false;
+  const [owner] = REPO.split("/");
+  const open = await gh().get(`/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`);
+  if (open.length) {
+    await save(run, { status: "reviewing", pr: open[0].number, reviewRequestedAt: now(), nudged: [] },
+      `♻️ Step ${st.step} PR #${open[0].number}을 찾아 검증 단계로 이어갑니다.`);
+    return true;
+  }
+  await openStepPR(run, branch, "", " (구현 결과를 복구해서)");
+  return true;
+}
+
 async function publish() {
   if (env.SKIP === "true") return log("prepare skipped; nothing to publish");
   const n = Number(env.ISSUE), mode = env.MODE, step = Number(env.STEP);
@@ -611,18 +667,7 @@ async function publish() {
     return block(run, mode === "fix" ? "수정 요청을 받았지만 새 커밋이 없습니다." : "변경 사항 없이 끝났습니다.", RUN_URL, "work");
   }
 
-  if (mode === "implement") {
-    const step0 = run.plan.steps.find((s) => s.id === step);
-    const pr = await gh().post("/pulls", {
-      title: `[run #${n}] Step ${step}: ${step0.title}`,
-      head: env.BRANCH,
-      base: C.runBranch(n),
-      body: C.prBody(n, run.plan, step, env.SUMMARY),
-    });
-    await save(run, { status: "reviewing", pr: pr.number, reviewRequestedAt: now(), nudged: [] },
-      `📝 Step ${step} PR #${pr.number}을 열었습니다. Codex 리뷰와 CI를 기다립니다.`);
-    return;
-  }
+  if (mode === "implement") return openStepPR(run, env.BRANCH, env.SUMMARY);
 
   const resolved = await resolveCodexThreads(st.pr).catch((e) => (log("resolve threads failed", e.message), 0));
   if (env.SUMMARY) await gh().post(`/issues/${st.pr}/comments`, { body: `${C.LOG_MARK}\n**수정 ${st.retries}회차 반영**\n\n${env.SUMMARY}` });

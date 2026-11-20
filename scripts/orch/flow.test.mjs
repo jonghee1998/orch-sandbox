@@ -45,7 +45,10 @@ function fakeGitHub() {
       if (db.labels.has(body.name)) return json(422, { message: "exists" });
       db.labels.add(body.name); return json(201, {});
     }
-    if (p === "/git/ref/heads/main") return json(200, { object: { sha: db.refs.main } });
+    if ((m = /^\/git\/ref\/heads\/(.+)$/.exec(p))) {
+      const name = decodeURIComponent(m[1]);
+      return db.refs[name] ? json(200, { object: { sha: db.refs[name] } }) : json(404, {});
+    }
     if (p === "/git/refs" && method === "POST") {
       const name = body.ref.replace("refs/heads/", "");
       if (db.refs[name]) return json(422, {});
@@ -95,7 +98,14 @@ function fakeGitHub() {
       return json(200, { merged: true });
     }
     if (/^\/pulls\/\d+\/(comments|reviews)$/.test(p)) return paged([]);
-    if (p.startsWith("/compare/")) return json(200, { files: db.compareFiles.map((filename) => ({ filename })) });
+    if (p.startsWith("/compare/")) {
+      const head = decodeURIComponent(p.split("...")[1] ?? "");
+      return json(200, { ahead_by: db.refs[head] ? 1 : 0, files: db.compareFiles.map((filename) => ({ filename })) });
+    }
+    if (p === "/pulls" && method === "GET") {
+      const head = (u.searchParams.get("head") ?? "").split(":")[1];
+      return json(200, Object.values(db.issues).filter((i) => i.pull_request && i.state === "open" && i.head.ref === head));
+    }
     if (p === "/contents/package.json") {
       const pkg = db.pkg[u.searchParams.get("ref")];
       return pkg ? json(200, { content: Buffer.from(JSON.stringify(pkg)).toString("base64") }) : json(404, {});
@@ -386,6 +396,43 @@ test("fallback review workflow fails without a verdict -> blocked (no silent wai
   await fire("workflow_run", { workflow: { name: "claude-review" }, workflow_run: { name: `claude-review #${n} pr ${pr}`, display_title: `claude-review #${n} pr ${pr}`, conclusion: "failure" } });
   assert.equal(state(n).status, "blocked");
   assert.match(state(n).reason, /판정 없이 실패/);
+});
+
+test("lost publish: pushed branch is recovered into a PR; nothing pushed -> blocked", async () => {
+  const lost = (n) => fire("workflow_run", { workflow: { name: "claude-work" }, workflow_run: {
+    name: `claude-work #${n} implement step 1`, display_title: `claude-work #${n} implement step 1`,
+    conclusion: "cancelled", created_at: new Date().toISOString(), html_url: "u" } });
+  const i1 = db.newIssue(plan(1));
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: i1 });
+  db.refs[C.stepBranch(i1.number, 1)] = sha("8");
+  await lost(i1.number);
+  assert.equal(state(i1.number).status, "reviewing");
+  const pr = db.issues[state(i1.number).pr];
+  assert.equal(pr.head.ref, C.stepBranch(i1.number, 1));
+  assert.match(db.comments[i1.number].at(-1).body, /복구/);
+  await lost(i1.number);                       // repeated event: state is no longer implementing -> no duplicate PR
+  assert.equal(Object.values(db.issues).filter((x) => x.pull_request && x.head?.ref === pr.head.ref).length, 1);
+
+  const i2 = db.newIssue(plan(1));
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: i2 });
+  await lost(i2.number);
+  assert.equal(state(i2.number).status, "blocked");
+});
+
+test("step PR already merged by a concurrent run is not reported as a failure", async () => {
+  const issue = db.newIssue(plan(2));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("1");
+  await publish(n, "implement", 1);
+  const pr = state(n).pr;
+  ciPass(sha("1"));
+  await codexSays(pr, sha("1"), "completed", false);
+  assert.equal(state(n).step, 2);
+  // a late duplicate event for the same (now merged) PR is ignored
+  await codexSays(pr, sha("1"), "completed", false);
+  assert.equal(state(n).status, "implementing");
+  assert.equal(state(n).step, 2);
 });
 
 test("Claude BLOCKED / no change / work failure -> blocked; untrusted triggers ignored", async () => {

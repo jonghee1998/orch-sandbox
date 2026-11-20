@@ -91,9 +91,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    concurrency:
-      group: orch-state-${{ github.repository }}
-      cancel-in-progress: false
+    # No concurrency group: this job must never be displaced. It only writes its own run's state,
+    # and only while that run is implementing/fixing the same step (checked before writing).
     permissions:
       contents: read
     steps:
