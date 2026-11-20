@@ -171,6 +171,19 @@ test("risk gate: dependencies, sensitive paths, file count", () => {
   assert.equal(C.classifyRisk(f(...Array.from({ length: 41 }, (_, i) => `src/f${i}.mjs`))).reasons[0].reason, "변경 파일이 많음");
 });
 
+test("pickModel: step > plan > auto, escalation after repeated failures", () => {
+  const mk = (extra = {}, step = {}) => C.validatePlan({ goal: "g", ...extra, steps: [{ id: 1, title: "t", task: "문자열 유틸 추가", done_when: ["x"], ...step }] }).plan;
+  assert.deepEqual(C.pickModel(mk(), 1), { model: "sonnet", why: "자동(일반 작업)" });
+  assert.equal(C.pickModel(mk({}, { task: "로그인 비밀번호 검사" }), 1).model, "opus");
+  assert.equal(C.pickModel(mk({}, { title: "Add DB migration" }), 1).model, "opus");
+  assert.equal(C.pickModel(mk({ model: "opus" }), 1).why, "계획 지정");
+  assert.equal(C.pickModel(mk({ model: "opus" }, { model: "sonnet" }), 1).model, "sonnet");
+  assert.equal(C.pickModel(mk(), 1, 1).model, "sonnet");
+  assert.deepEqual(C.pickModel(mk(), 1, 2), { model: "opus", why: "검수 2회 실패로 상향" });
+  assert.equal(C.pickModel(mk({}, { model: "claude-opus-5-5" }), 1, 3).model, "claude-opus-5-5");
+  assert.equal(C.validatePlan({ goal: "g", steps: [{ id: 1, title: "t", task: "x", done_when: ["x"], model: "a b" }] }).ok, false);
+});
+
 test("extractSummary + finalReport + plan options", () => {
   const body = "<!-- orch-run:1:1 -->\nRun\n\n## 변경 요약\n- a 추가\n- b 수정\n\n## 완료 기준 확인\n- ✅ x\n- ❌ 이메일 발송은 확인 못 함\n\n---\n완료 기준:\n- ❌ not this";
   const ex = C.extractSummary(body);
@@ -186,17 +199,4 @@ test("extractSummary + finalReport + plan options", () => {
   assert.match(rep, /\*\*DB 구조 변경\*\*: x\.sql/);
   assert.match(rep, /Step 1: ❌ 이메일 발송은 확인 못 함/);
   assert.match(rep, /npm test 통과/, "done_when used as how-to when plan.try is empty");
-});
-
-test("pickModel: step > plan > auto, escalation after repeated failures", () => {
-  const mk = (extra = {}, step = {}) => C.validatePlan({ goal: "g", ...extra, steps: [{ id: 1, title: "t", task: "문자열 유틸 추가", done_when: ["x"], ...step }] }).plan;
-  assert.deepEqual(C.pickModel(mk(), 1), { model: "sonnet", why: "자동(일반 작업)" });
-  assert.equal(C.pickModel(mk({}, { task: "로그인 비밀번호 검사" }), 1).model, "opus");
-  assert.equal(C.pickModel(mk({}, { title: "Add DB migration" }), 1).model, "opus");
-  assert.equal(C.pickModel(mk({ model: "opus" }), 1).why, "계획 지정");
-  assert.equal(C.pickModel(mk({ model: "opus" }, { model: "sonnet" }), 1).model, "sonnet");
-  assert.equal(C.pickModel(mk(), 1, 1).model, "sonnet");
-  assert.deepEqual(C.pickModel(mk(), 1, 2), { model: "opus", why: "검수 2회 실패로 상향" });
-  assert.equal(C.pickModel(mk({}, { model: "claude-opus-5-5" }), 1, 3).model, "claude-opus-5-5");
-  assert.equal(C.validatePlan({ goal: "g", steps: [{ id: 1, title: "t", task: "x", done_when: ["x"], model: "a b" }] }).ok, false);
 });
