@@ -86,8 +86,11 @@ async function publish(file) {
   const existing = (issues ?? []).find((i) => !i.pull_request) ?? null;
   const prev = readUsage(existing?.body);
 
-  const since = new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString();
-  const comments = await gh.all(`/issues/comments?since=${encodeURIComponent(since)}&sort=updated&direction=desc`);
+  // Codex comments live on PRs. The repo-wide comment listing proved incomplete with the workflow token,
+  // so read the 15 most recently updated PRs directly.
+  const prs = (await gh.get("/pulls?state=all&sort=updated&direction=desc&per_page=15")) ?? [];
+  const comments = [];
+  for (const pr of prs) comments.push(...((await gh.get(`/issues/${pr.number}/comments?per_page=100`)) ?? []));
   const codex = codexFromComments(comments, now.getTime());
 
   // Keep the last good Claude value when this probe could not read one (skipped or failed).
