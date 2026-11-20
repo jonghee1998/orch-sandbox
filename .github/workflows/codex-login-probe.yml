@@ -1,0 +1,53 @@
+# Temporary probe (do not merge): device-code login for Codex on a runner, then account/rateLimits/read.
+# The login URL and one-time code are posted to this PR so the owner can approve from a phone.
+# Credentials stay on the runner and are deleted at the end (nothing persisted in this probe).
+name: codex-login-probe
+on:
+  pull_request:
+    paths: [".github/workflows/codex-login-probe.yml", ".github/probe/**"]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Install Codex CLI
+        run: npm i -g @openai/codex >/dev/null 2>&1 && codex --version && (codex login --help | head -20)
+      - name: Device-code login (approve on phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set +e
+          codex login --device-auth > /tmp/login.log 2>&1 &
+          LP=$!
+          for i in $(seq 1 30); do sleep 2; grep -qiE "https://|code" /tmp/login.log && break; done
+          sleep 2
+          # strip ANSI, show the prompt (URL + one-time code only; no tokens are printed by the CLI here)
+          sed 's/\x1b\[[0-9;]*m//g' /tmp/login.log | head -20
+          URL=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/login.log | grep -oE 'https://[^ ]+' | head -1)
+          CODE=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/login.log | grep -oE '\b[A-Z0-9]{4}-[A-Z0-9]{4,5}\b' | head -1)
+          if [ -n "$URL" ]; then
+            gh api repos/$GITHUB_REPOSITORY/issues/$PR/comments -f body="📱 Codex 로그인 승인 요청
+          1. 이 주소를 폰에서 여세요: $URL
+          2. 코드 입력: **${CODE:-로그 참고}**
+          15분 안에 승인하면 이 실행이 이어서 사용량을 조회합니다." --silent
+          fi
+          for i in $(seq 1 90); do
+            kill -0 $LP 2>/dev/null || break
+            sleep 10
+          done
+          wait $LP; echo "login exit $?"
+          sed 's/\x1b\[[0-9;]*m//g' /tmp/login.log | tail -3
+          codex login status 2>&1 | head -3
+      - name: account/rateLimits/read
+        run: node .github/probe/ratelimits.mjs
+      - name: Remove credentials
+        if: always()
+        run: rm -rf ~/.codex
