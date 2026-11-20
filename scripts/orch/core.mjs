@@ -378,6 +378,14 @@ export function extractSummary(prBodyText) {
   return { summary, unmet };
 }
 
+/** Fallback summary when Claude left no SUMMARY.md: list the files the step changed. */
+export function filesSummary(files) {
+  const names = (files ?? []).map((f) => (typeof f === "string" ? f : f?.filename)).filter(Boolean);
+  if (!names.length) return "";
+  const shown = names.slice(0, 5).map((x) => `\`${x}\``).join(", ");
+  return `- (자동 요약) 바뀐 파일: ${shown}${names.length > 5 ? ` 외 ${names.length - 5}개` : ""}`;
+}
+
 /**
  * Completion report written for a non-developer: what was built, how to try it,
  * how it was checked, what to watch out for, what was not verified.

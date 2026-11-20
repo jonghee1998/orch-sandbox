@@ -314,7 +314,11 @@ async function openFinal(run) {
   for (const s of plan.steps) {
     const prNum = st.passed?.[s.id];
     const prObj = prNum ? await gh().get(`/pulls/${prNum}`, { allow404: true }) : null;
-    const { summary, unmet } = C.extractSummary(prObj?.body);
+    let { summary, unmet } = C.extractSummary(prObj?.body);
+    if (!summary && prNum) {
+      const prFiles = await gh().get(`/pulls/${prNum}/files?per_page=100`, { allow404: true });
+      summary = C.filesSummary(prFiles);
+    }
     const info = st.stepInfo?.[s.id] ?? {};
     steps.push({ id: s.id, title: s.title, pr: prNum, summary, unmet, reviewer: REVIEWER_SHORT[info.reviewer] ?? "-", retries: info.retries ?? 0 });
   }
