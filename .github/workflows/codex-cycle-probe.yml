@@ -1,0 +1,167 @@
+# Temporary probe (do not merge): full cycle — phone login → encrypted cache → restore → rateLimits read.
+name: codex-cycle-probe
+on:
+  pull_request:
+    paths: [".github/workflows/codex-cycle-probe.yml"]
+permissions: {}
+concurrency:
+  group: orch-usage-probe
+  cancel-in-progress: false
+jobs:
+  login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+    steps:
+      - name: Check key
+        env:
+          CODEX_AUTH_KEY: ${{ secrets.CODEX_AUTH_KEY }}
+        run: |
+          if [ ${#CODEX_AUTH_KEY} -lt 20 ]; then
+            echo "### 먼저 저장소 Settings → Secrets → Actions 에 CODEX_AUTH_KEY(20자 이상 아무 문자열)를 추가하세요." >> "$GITHUB_STEP_SUMMARY"; exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Device-code login (approve on phone)
+        id: login
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          umask 077
+          npm i -g @openai/codex >/dev/null 2>&1
+          codex login --device-auth > /tmp/login.log 2>&1 &
+          LP=$!
+          for i in $(seq 1 30); do sleep 2; grep -q 'https://' /tmp/login.log && break; done
+          sleep 2
+          URL=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/login.log | grep -oE 'https://[^ ]+' | head -1)
+          CODE=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/login.log | grep -oE '\b[A-Z0-9]{4}-[A-Z0-9]{4,5}\b' | head -1)
+          MSG="📱 **Codex 로그인 승인** — 15분 안에
+          1. 폰에서 열기: ${URL:-로그인 주소를 찾지 못함}
+          2. 코드 입력: **${CODE:-?}**"
+          echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+          ISSUE=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=orch:usage&state=open&per_page=1" --jq '.[0].number // empty')
+          [ -n "$ISSUE" ] && gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE/comments" -f body="$MSG" --silent
+          for i in $(seq 1 90); do kill -0 $LP 2>/dev/null || break; sleep 10; done
+          wait $LP; rc=$?
+          if [ $rc -eq 0 ] && codex login status >/dev/null 2>&1; then echo "ok=true" >> "$GITHUB_OUTPUT"; echo "✅ 로그인 완료" >> "$GITHUB_STEP_SUMMARY"
+          else echo "❌ 로그인 실패 또는 시간 초과 — 다시 실행하세요." >> "$GITHUB_STEP_SUMMARY"; exit 1; fi
+      - name: Encrypt login
+        if: steps.login.outputs.ok == 'true'
+        env:
+          CODEX_AUTH_KEY: ${{ secrets.CODEX_AUTH_KEY }}
+        run: |
+          umask 077; mkdir -p ~/.orch
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CODEX_AUTH_KEY -in ~/.codex/auth.json -out ~/.orch/codex-auth.enc
+      - name: Remove Codex credentials from the runner
+        if: always()
+        run: rm -rf ~/.codex
+      - name: Save encrypted login
+        if: steps.login.outputs.ok == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.orch/codex-auth.enc
+          key: codex-auth-${{ github.run_id }}
+      - name: Prune old entries and refresh usage now
+        if: steps.login.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: codex-auth-${{ github.run_id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=codex-auth-&per_page=100" --jq '.actions_caches[] | select(.key != env.KEEP) | .id' \
+            | while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent || true; done
+  usage:
+    needs: login
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      issues: write
+      actions: write   # prune old encrypted-login cache entries
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: false
+          sparse-checkout: scripts/orch
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Claude usage probe
+        id: probe
+        continue-on-error: true
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ORCH_PAUSED: ${{ vars.ORCH_PAUSED }}
+        run: |
+          case "$(echo "$ORCH_PAUSED" | tr '[:upper:]' '[:lower:]' | xargs)" in
+            on|true|1|yes|enabled|enable) echo "note=전체 일시정지 중이라 이번 확인 생략" >> "$GITHUB_OUTPUT"; exit 0;;
+          esac
+          npm i -g @anthropic-ai/claude-code >/dev/null 2>&1
+          claude -p "Reply with OK only." --model haiku --max-turns 1 --output-format stream-json --verbose > "$RUNNER_TEMP/usage.jsonl"
+      - name: Codex quota schedule (every 3h)
+        id: codex
+        env:
+          CODEX_AUTH_KEY: ${{ secrets.CODEX_AUTH_KEY }}
+          EVENT: workflow_dispatch
+        run: |
+          hour=$(date -u +%H)
+          if [ "$EVENT" = schedule ] && [ $((10#$hour % 3)) -ne 0 ]; then echo "note=" >> "$GITHUB_OUTPUT"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ -z "$CODEX_AUTH_KEY" ]; then echo "note=CODEX_AUTH_KEY 시크릿 없음" >> "$GITHUB_OUTPUT"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+      - name: Restore encrypted Codex login
+        if: steps.codex.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.orch/codex-auth.enc
+          key: codex-auth-latest
+          restore-keys: codex-auth-
+      - name: Read Codex limits
+        id: codexread
+        if: steps.codex.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          CODEX_AUTH_KEY: ${{ secrets.CODEX_AUTH_KEY }}
+        run: |
+          umask 077
+          if [ ! -f ~/.orch/codex-auth.enc ]; then echo "note=로그인 필요" >> "$GITHUB_OUTPUT"; exit 0; fi
+          mkdir -p ~/.codex
+          if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CODEX_AUTH_KEY -in ~/.orch/codex-auth.enc -out ~/.codex/auth.json 2>/dev/null; then
+            rm -f ~/.codex/auth.json; echo "note=로그인 필요" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          before=$(sha256sum ~/.codex/auth.json | cut -c1-64)
+          npm i -g @openai/codex >/dev/null 2>&1
+          node scripts/orch/codex-limits.mjs "$RUNNER_TEMP/codex-limits.json"
+          after=$(sha256sum ~/.codex/auth.json 2>/dev/null | cut -c1-64)
+          if [ -n "$after" ] && [ "$before" != "$after" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CODEX_AUTH_KEY -in ~/.codex/auth.json -out ~/.orch/codex-auth.enc
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Remove Codex credentials from the runner
+        if: always()
+        run: rm -rf ~/.codex
+      - name: Save refreshed encrypted login
+        if: steps.codexread.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.orch/codex-auth.enc
+          key: codex-auth-${{ github.run_id }}
+      - name: Prune old login cache entries
+        if: steps.codexread.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: codex-auth-${{ github.run_id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=codex-auth-&per_page=100" --jq '.actions_caches[] | select(.key != env.KEEP) | .id' \
+            | while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent || true; done
+      - name: Publish snapshot
+        run: node scripts/orch/usage.mjs publish "$RUNNER_TEMP/usage.jsonl"
+        env:
+          GH_WRITE_TOKEN: ${{ github.token }}
+          PROBE_NOTE: ${{ steps.probe.outputs.note || (steps.probe.outcome == 'failure' && 'Claude 실행 실패' || '') }}
+          CODEX_LIMITS_FILE: ${{ runner.temp }}/codex-limits.json
+          CODEX_NOTE: ${{ steps.codex.outputs.note || steps.codexread.outputs.note || (steps.codexread.outcome == 'failure' && '조회 실패' || '') }}
