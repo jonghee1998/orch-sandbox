@@ -244,7 +244,7 @@ test("retry limit -> blocked with notification; resume restarts the step on a ne
 const ACTIONS = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
 const claudeReviewSays = (pr, headSha, verdict, findings = []) => {
   db.addComment(pr, C.claudeReviewComment({ sha: headSha, verdict, summary: "s", findings, runUrl: "u" }), ACTIONS);
-  return fire("workflow_run", { workflow_run: { name: "claude-review", display_title: `claude-review #0 pr ${pr}`, conclusion: "success" } });
+  return fire("workflow_run", { workflow: { name: "claude-review" }, workflow_run: { name: `claude-review #0 pr ${pr}`, display_title: `claude-review #0 pr ${pr}`, conclusion: "success" } });
 };
 
 test("Codex failed (usage limit) -> Claude fallback review once -> FAIL -> fix -> fallback PASS -> done", async () => {
@@ -264,7 +264,7 @@ test("Codex failed (usage limit) -> Claude fallback review once -> FAIL -> fix -
 
   // A PASS-looking marker from the owner account (e.g. written by the implementing job) is not trusted
   db.addComment(pr, C.claudeReviewComment({ sha: sha("f"), verdict: "PASS", summary: "", findings: [], runUrl: "u" }), OWNER);
-  await fire("workflow_run", { workflow_run: { name: "claude-review", display_title: `claude-review #${n} pr ${pr}`, conclusion: "success" } });
+  await fire("workflow_run", { workflow: { name: "claude-review" }, workflow_run: { name: `claude-review #${n} pr ${pr}`, display_title: `claude-review #${n} pr ${pr}`, conclusion: "success" } });
   assert.equal(state(n).status, "reviewing");
 
   await claudeReviewSays(pr, sha("f"), "FAIL", [{ path: "src/text.mjs", line: 3, body: "null 처리 누락" }]);
@@ -309,7 +309,7 @@ test("fallback review workflow fails without a verdict -> blocked (no silent wai
   ciPass(sha("5"));
   await codexSays(pr, sha("5"), "failed", true);
   assert.equal(state(n).claudeReviewFor, sha("5"));
-  await fire("workflow_run", { workflow_run: { name: "claude-review", display_title: `claude-review #${n} pr ${pr}`, conclusion: "failure" } });
+  await fire("workflow_run", { workflow: { name: "claude-review" }, workflow_run: { name: `claude-review #${n} pr ${pr}`, display_title: `claude-review #${n} pr ${pr}`, conclusion: "failure" } });
   assert.equal(state(n).status, "blocked");
   assert.match(state(n).reason, /판정 없이 실패/);
 });

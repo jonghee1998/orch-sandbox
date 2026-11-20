@@ -368,11 +368,13 @@ async function onEvent() {
 
   if (name === "workflow_run") {
     const wr = ev.workflow_run;
-    if (wr.name === "claude-review") {
+    // With `run-name`, workflow_run.name is the run title ("claude-review #1 pr 2"); use the workflow's name.
+    const wf = ev.workflow?.name ?? wr.name;
+    if (wf === "claude-review") {
       const m = /#(\d+) pr (\d+)/.exec(wr.display_title ?? "");
       return m ? evaluatePR(Number(m[2]), { reviewRunFailed: wr.conclusion !== "success" }) : undefined;
     }
-    if (wr.name === "claude-work") {
+    if (wf === "claude-work") {
       // The publish job handles normal results. This only catches a run cancelled before publish could act.
       const m = /#(\d+) /.exec(wr.display_title ?? "");
       if (!m || wr.conclusion === "success") return;
