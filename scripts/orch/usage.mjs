@@ -89,6 +89,7 @@ async function publish(file) {
   const since = new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString();
   const comments = await gh.all(`/issues/comments?since=${encodeURIComponent(since)}&sort=updated&direction=desc`);
   const codex = codexFromComments(comments, now.getTime());
+  console.log(`[usage] comments=${comments.length} codexBot=${comments.filter((c) => c?.user?.login === "chatgpt-codex-connector[bot]").length} first=${comments[0]?.updated_at ?? "-"} last=${comments.at(-1)?.updated_at ?? "-"}`);
 
   // Keep the last good Claude value when this probe could not read one (skipped or failed).
   const u = {
