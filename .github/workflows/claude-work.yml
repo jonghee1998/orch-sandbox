@@ -51,6 +51,11 @@ jobs:
           ISSUE: ${{ inputs.issue }}
           MODE: ${{ inputs.mode }}
           STEP: ${{ inputs.step }}
+          ORCH_SONNET: ${{ vars.ORCH_SONNET }}
+          ORCH_OPUS: ${{ vars.ORCH_OPUS }}
+          ORCH_CODEX: ${{ vars.ORCH_CODEX }}
+          ORCH_PAUSED: ${{ vars.ORCH_PAUSED }}
+          ORCH_WINDOW: ${{ vars.ORCH_WINDOW }}
       - name: Install dependencies
         if: steps.prep.outputs.skip != 'true'
         run: if [ -f package-lock.json ]; then npm ci; fi
@@ -117,3 +122,8 @@ jobs:
           CHANGED: ${{ needs.work.outputs.changed }}
           BLOCKED: ${{ needs.work.outputs.blocked }}
           SUMMARY: ${{ needs.work.outputs.summary }}
+          ORCH_SONNET: ${{ vars.ORCH_SONNET }}
+          ORCH_OPUS: ${{ vars.ORCH_OPUS }}
+          ORCH_CODEX: ${{ vars.ORCH_CODEX }}
+          ORCH_PAUSED: ${{ vars.ORCH_PAUSED }}
+          ORCH_WINDOW: ${{ vars.ORCH_WINDOW }}

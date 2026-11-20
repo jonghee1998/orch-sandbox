@@ -26,6 +26,7 @@ const REVIEW_IDLE_MIN = 120;         // reviewing without verdict even after nud
 const SELF_CHECKS = ["advance", "work", "publish"];
 
 const now = () => new Date().toISOString();
+const SW = () => C.readSwitches(env);
 const minutesSince = (iso) => (iso ? (Date.now() - Date.parse(iso)) / 60000 : Infinity);
 const log = (...a) => console.log("[orch]", ...a);
 
@@ -104,11 +105,40 @@ async function setLabels(n, add = [], remove = []) {
   }
 }
 
+/** Hold new work while switches forbid it. Logs once per distinct reason. */
+async function holdWork(run, mode, reason) {
+  const prev = run.state?.held;
+  if (prev?.mode === mode && prev?.reason === reason) return;
+  await save(run, { held: { mode, reason, since: now() } },
+    `⏸️ 대기 (Step ${run.state?.step ?? "-"}): ${reason}. 스위치가 다시 켜지면 자동으로 이어갑니다.`);
+}
+
+async function releaseHold(run) {
+  if (!run.state?.held) return;
+  const was = run.state.held;
+  await save(run, { held: null, requestedAt: now() }, `▶️ 대기 해제: ${was.reason} → 작업을 이어갑니다.`);
+}
+
+/** Dispatch implement/fix work unless the ON/OFF switches hold it. Returns true if dispatched. */
 async function dispatchWork(run, mode) {
+  const sw = SW();
+  const pick = C.pickModel(run.plan, run.state.step, mode === "implement" ? 0 : run.state.retries ?? 0);
+  const hold = C.gateReason(sw) ?? C.resolveModel(pick, sw).hold ?? null;
+  if (hold) {
+    await holdWork(run, mode, hold);
+    return false;
+  }
+  await releaseHold(run);
   await ro().post("/actions/workflows/claude-work.yml/dispatches", {
     ref: "main",
     inputs: { issue: String(run.n), mode, step: String(run.state.step) },
   });
+  return true;
+}
+
+/** "@codex review" only while Codex is ON (when OFF its verdicts are ignored anyway). */
+async function askCodex(prNumber) {
+  if (SW().codex) await gh().post(`/issues/${prNumber}/comments`, { body: "@codex review" });
 }
 
 async function block(run, reason, url, kind = "work") {
@@ -157,7 +187,7 @@ async function start(run, sender) {
     if (st.blockKind === "review" && pr?.state === "open") {
       await save(run, { status: "reviewing", reason: null, reviewRequestedAt: now(), nudged: [pr.head.sha], claudeReviewFor: null },
         `▶️ 재개: PR #${pr.number} 재검증을 요청했습니다.`);
-      await gh().post(`/issues/${pr.number}/comments`, { body: "@codex review" });
+      await askCodex(pr.number);
     } else {
       if (pr?.state === "open") {
         await gh().post(`/issues/${pr.number}/comments`, { body: `${C.LOG_MARK}\n재개로 이 스텝을 처음부터 다시 구현하므로 PR을 닫습니다.` });
@@ -219,22 +249,37 @@ async function evaluatePR(prNumber, { reviewRunFailed = false } = {}) {
   const codex = C.codexVerdict(comments, pr.head.sha);
   const ci = C.ciVerdict(await ro().all(`/commits/${pr.head.sha}/check-runs`), SELF_CHECKS);
 
-  // Codex unavailable (e.g. usage limit) -> independent Claude (Opus) review in a separate workflow.
+  // Codex OFF or unavailable (e.g. usage limit) -> independent Claude (Opus) review in a separate workflow.
+  const sw = SW();
+  const route = C.reviewRoute(sw, codex.result === "error");
+  if (!route) {
+    await holdWork(run, "review", "검수할 수 있는 AI가 없음 (Codex OFF 또는 사용 불가 + Opus OFF)");
+    return { run, pr, codex, fallback: true, held: true };
+  }
+  // Release a review hold once a reviewer is available and nothing new needs dispatching.
+  if (st.held?.mode === "review" && (route === "codex" || st.claudeReviewFor === pr.head.sha)) await releaseHold(run);
   let review = codex;
-  if (codex.result === "error") {
+  if (route === "claude") {
+    const why = sw.codex ? `Codex 리뷰를 쓸 수 없어(status=${codex.status})` : "Codex가 OFF라";
     const cr = C.claudeReviewVerdict(comments, pr.head.sha);
-    log(`PR #${pr.number}: codex=error(${codex.status}) -> claude review ${cr.result}`);
+    log(`PR #${pr.number}: codex=${sw.codex ? codex.result : "off"} -> claude review ${cr.result}`);
     if (cr.result === "none") {
       if (reviewRunFailed && st.claudeReviewFor === pr.head.sha) {
         return block(run, "Claude 대체 검수 워크플로가 판정 없이 실패했습니다.", pr.html_url, "review");
       }
       if (st.claudeReviewFor !== pr.head.sha) {
+        const gate = C.gateReason(sw);
+        if (gate) {
+          await holdWork(run, "review", gate);
+          return { run, pr, codex, fallback: true, held: true };
+        }
+        await releaseHold(run);
         await ro().post("/actions/workflows/claude-review.yml/dispatches", {
           ref: "main",
           inputs: { issue: String(run.n), pr: String(pr.number), sha: pr.head.sha },
         });
         await save(run, { claudeReviewFor: pr.head.sha, reviewRequestedAt: now() },
-          `🔁 Codex 리뷰를 쓸 수 없어(status=${codex.status}) Claude(Opus) 대체 검수를 요청했습니다 (PR #${pr.number}).`);
+          `🔁 ${why} Claude(Opus) 대체 검수를 요청했습니다 (PR #${pr.number}).`);
       }
       return { run, pr, codex, fallback: true };
     }
@@ -407,17 +452,23 @@ async function watchOne(n) {
   if (st.status === "reviewing" && st.pr) {
     const r = await evaluatePR(st.pr);          // re-evaluate in case an event was missed
     run = await loadRun(n);
-    if (run.state.status !== "reviewing" || !r) return;
+    if (run.state.status !== "reviewing" || !r || r.held) return;
     const head = r.pr.head.sha;
     const nudged = run.state.nudged ?? [];
     if (!r.fallback && r.codex.result === "none" && minutesSince(run.state.reviewRequestedAt) > NUDGE_AFTER_MIN && !nudged.includes(head)) {
-      await gh().post(`/issues/${st.pr}/comments`, { body: "@codex review" });
+      await askCodex(st.pr);
       await save(run, { nudged: [...nudged, head] }, `🔔 ${NUDGE_AFTER_MIN}분 동안 Codex 판정이 없어 리뷰를 다시 요청했습니다 (PR #${st.pr}).`);
       return;
     }
     if (minutesSince(run.state.updatedAt) > REVIEW_IDLE_MIN) {
       await block(run, `${REVIEW_IDLE_MIN}분 동안 Codex/CI 판정이 없습니다.`, r.pr.html_url, "review");
     }
+    return;
+  }
+
+  // Held by ON/OFF switches: retry the dispatch; nothing times out while held.
+  if (["implementing", "fixing"].includes(st.status) && st.held) {
+    await dispatchWork(run, st.held.mode === "fix" ? "fix" : st.status === "fixing" ? "fix" : "implement");
     return;
   }
 
@@ -556,7 +607,10 @@ async function prepare() {
   setOutput("skip", "false");
   setOutput("branch", branch);
   setOutput("start_sha", git("rev-parse", "HEAD"));
-  const pick = C.pickModel(run.plan, step, mode === "implement" ? 0 : st.retries ?? 0);
+  // Already dispatched: switches turned off since then do not stop it (drain); only swap a model that is OFF.
+  const picked = C.pickModel(run.plan, step, mode === "implement" ? 0 : st.retries ?? 0);
+  const resolved = C.resolveModel(picked, SW());
+  const pick = resolved.hold ? picked : resolved;
   log(`model: ${pick.model} (${pick.why})`);
   setOutput("model_args", `--model ${pick.model}`);
   setOutput("prompt", prompt);
@@ -684,7 +738,7 @@ async function publish() {
 
   const resolved = await resolveCodexThreads(st.pr).catch((e) => (log("resolve threads failed", e.message), 0));
   if (env.SUMMARY) await gh().post(`/issues/${st.pr}/comments`, { body: `${C.LOG_MARK}\n**수정 ${st.retries}회차 반영**\n\n${env.SUMMARY}` });
-  await gh().post(`/issues/${st.pr}/comments`, { body: "@codex review" });
+  await askCodex(st.pr);
   await save(run, { status: "reviewing", reviewRequestedAt: now(), nudged: [] },
     `🔍 Step ${step} 수정 커밋을 푸시하고 재검증을 요청했습니다 (PR #${st.pr}, 기존 Codex 스레드 ${resolved}건 resolve).`);
 }
