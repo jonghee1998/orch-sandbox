@@ -1,0 +1,310 @@
+// End-to-end state machine test against an in-memory fake GitHub API (no network).
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import * as C from "./core.mjs";
+
+const OWNER = { login: "owner", id: 1, type: "User" };
+const CODEX = { login: C.CODEX_BOT.login, id: C.CODEX_BOT.id, type: "Bot" };
+const sha = (c) => c.repeat(40);
+
+function fakeGitHub() {
+  const db = { seq: 0, issues: {}, comments: {}, labels: new Set(), refs: { main: sha("0") }, dispatches: [], checks: {}, notifications: [], merges: [] };
+  let clock = Date.parse("2026-11-20T00:00:00Z");
+  const ts = () => new Date((clock += 1000)).toISOString();
+  const json = (status, body) => new Response(body === undefined ? null : JSON.stringify(body), {
+    status, headers: { "content-type": "application/json" },
+  });
+
+  db.newIssue = (body, user = OWNER, extra = {}) => {
+    const n = ++db.seq;
+    db.issues[n] = { number: n, body, user, state: "open", labels: [], html_url: `https://gh/i/${n}`, ...extra };
+    db.comments[n] = [];
+    return db.issues[n];
+  };
+  db.addComment = (n, body, user = OWNER) => {
+    const c = { id: ++db.seq * 1000, body, user, created_at: ts(), updated_at: ts(), html_url: `https://gh/c/${n}` };
+    db.comments[n].push(c);
+    return c;
+  };
+
+  async function handler(url, init = {}) {
+    const u = new URL(url);
+    const method = init.method ?? "GET";
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    if (u.hostname === "ntfy.sh") { db.notifications.push(body); return json(200, {}); }
+    const p = u.pathname.replace(/^\/repos\/o\/r/, "");
+    const page = Number(u.searchParams.get("page") ?? 1);
+    const paged = (arr) => json(200, page > 1 ? [] : arr);
+    let m;
+
+    if (p === "/graphql") return json(200, { data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } });
+    if (p === "/labels" && method === "POST") {
+      if (db.labels.has(body.name)) return json(422, { message: "exists" });
+      db.labels.add(body.name); return json(201, {});
+    }
+    if (p === "/git/ref/heads/main") return json(200, { object: { sha: db.refs.main } });
+    if (p === "/git/refs" && method === "POST") {
+      const name = body.ref.replace("refs/heads/", "");
+      if (db.refs[name]) return json(422, {});
+      db.refs[name] = body.sha; return json(201, {});
+    }
+    if (p === "/issues" && method === "GET") {
+      const label = u.searchParams.get("labels");
+      return paged(Object.values(db.issues).filter((i) => i.state === "open" && i.labels.some((l) => l.name === label)));
+    }
+    if ((m = /^\/issues\/(\d+)$/.exec(p))) {
+      const it = db.issues[m[1]];
+      if (!it) return json(404, {});
+      if (method === "PATCH") Object.assign(it, body);
+      return json(200, it);
+    }
+    if ((m = /^\/issues\/(\d+)\/comments$/.exec(p))) {
+      if (method === "POST") return json(201, db.addComment(m[1], body.body));
+      return paged(db.comments[m[1]] ?? []);
+    }
+    if ((m = /^\/issues\/(\d+)\/labels$/.exec(p))) {
+      const it = db.issues[m[1]];
+      for (const l of body.labels) if (!it.labels.some((x) => x.name === l)) it.labels.push({ name: l });
+      return json(200, it.labels);
+    }
+    if ((m = /^\/issues\/(\d+)\/labels\/(.+)$/.exec(p))) {
+      const it = db.issues[m[1]];
+      const name = decodeURIComponent(m[2]);
+      if (!it.labels.some((l) => l.name === name)) return json(404, {});
+      it.labels = it.labels.filter((l) => l.name !== name); return json(200, []);
+    }
+    if (p === "/pulls" && method === "POST") {
+      const pr = db.newIssue(body.body, OWNER, {
+        pull_request: {}, title: body.title, head: { ref: body.head, sha: db.refs[body.head] ?? sha("1") }, base: { ref: body.base },
+      });
+      return json(201, pr);
+    }
+    if ((m = /^\/pulls\/(\d+)$/.exec(p))) {
+      const pr = db.issues[m[1]];
+      if (!pr?.pull_request) return json(404, {});
+      if (method === "PATCH") Object.assign(pr, body);
+      return json(200, pr);
+    }
+    if ((m = /^\/pulls\/(\d+)\/merge$/.exec(p))) {
+      const pr = db.issues[m[1]];
+      if (body.sha !== pr.head.sha) return json(409, { message: "Head branch was modified" });
+      pr.state = "closed"; pr.merged_at = ts(); db.merges.push({ pr: pr.number, ...body });
+      return json(200, { merged: true });
+    }
+    if (/^\/pulls\/\d+\/(comments|reviews)$/.test(p)) return paged([]);
+    if ((m = /^\/commits\/([a-f0-9]+)\/check-runs$/.exec(p))) return json(200, { check_runs: page > 1 ? [] : db.checks[m[1]] ?? [] });
+    if (p === "/actions/workflows/claude-work.yml/dispatches") { db.dispatches.push(body.inputs); return json(204); }
+    if (p === "/actions/workflows/claude-work.yml/runs") return json(200, { workflow_runs: [] });
+    throw new Error(`fake GitHub: unhandled ${method} ${p}`);
+  }
+  return { db, handler };
+}
+
+// ---------------------------------------------------------------- harness
+
+const { db, handler } = fakeGitHub();
+globalThis.fetch = handler;
+Object.assign(process.env, {
+  GITHUB_REPOSITORY: "o/r", BOT_PAT: "pat", READ_TOKEN: "ro", NTFY_TOPIC: "t", GITHUB_RUN_ID: "9", GITHUB_SERVER_URL: "https://gh",
+});
+delete process.env.GITHUB_OUTPUT;
+process.env.GITHUB_REPOSITORY = "o/r";
+const { commands } = await import("./main.mjs");
+// The fake repo owner is "o"; make the fake owner login match.
+OWNER.login = "o";
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "orch-"));
+async function fire(name, payload) {
+  const file = path.join(tmp, `${Math.random()}.json`);
+  fs.writeFileSync(file, JSON.stringify(payload));
+  process.env.GITHUB_EVENT_NAME = name;
+  process.env.GITHUB_EVENT_PATH = file;
+  await commands.event();
+}
+async function publish(issue, mode, step, extra = {}) {
+  Object.assign(process.env, {
+    ISSUE: String(issue), MODE: mode, STEP: String(step), WORK_RESULT: "success", SKIP: "false",
+    CHANGED: "true", BLOCKED: "", SUMMARY: "## 변경 요약\n- 테스트", BRANCH: C.stepBranch(issue, step), ...extra,
+  });
+  await commands.publish();
+}
+const state = (n) => C.readState(db.issues[n].body);
+const labels = (n) => db.issues[n].labels.map((l) => l.name).sort();
+const codexSays = (pr, headSha, status, unresolved) => {
+  const body = `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${headSha}","has_unresolved_findings":${unresolved},"status":"${status}"}} -->`;
+  const c = db.addComment(pr, body, CODEX);
+  return fire("issue_comment", { action: "created", issue: { number: pr, pull_request: {} }, comment: c });
+};
+const ciPass = (s) => { db.checks[s] = [{ name: "test", status: "completed", conclusion: "success", html_url: "u" }]; };
+const ciFail = (s) => { db.checks[s] = [{ name: "test", status: "completed", conclusion: "failure", html_url: "u" }]; };
+
+const plan = (steps, extra = {}) => `계획\n\n\`\`\`json\n${JSON.stringify({
+  goal: "테스트 목표",
+  steps: Array.from({ length: steps }, (_, i) => ({ id: i + 1, title: `스텝${i + 1}`, task: "do", done_when: ["npm test 통과"] })),
+  ...extra,
+})}\n\`\`\``;
+
+// ---------------------------------------------------------------- scenarios
+
+test("happy path with one fix round: start -> PR -> FAIL -> fix -> PASS -> next step -> final PR -> done", async () => {
+  const issue = db.newIssue(plan(2));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  assert.equal(state(n).status, "implementing");
+  assert.equal(db.refs[C.runBranch(n)], sha("0"), "run branch from main");
+  assert.deepEqual(db.dispatches.at(-1), { issue: String(n), mode: "implement", step: "1" });
+  assert.deepEqual(labels(n), ["orch:run"]);
+
+  db.refs[C.stepBranch(n, 1)] = sha("a");
+  await publish(n, "implement", 1);
+  const pr1 = state(n).pr;
+  assert.equal(state(n).status, "reviewing");
+  assert.equal(db.issues[pr1].base.ref, C.runBranch(n));
+  assert.deepEqual(C.parsePrMarker(db.issues[pr1].body), { issue: n, step: 1 });
+
+  // CI passes but Codex finds problems -> fix
+  ciPass(sha("a"));
+  await codexSays(pr1, sha("a"), "in_progress", false);
+  assert.equal(state(n).status, "reviewing", "in_progress -> wait");
+  await codexSays(pr1, sha("a"), "completed", true);
+  assert.equal(state(n).status, "fixing");
+  assert.equal(state(n).retries, 1);
+  assert.deepEqual(db.dispatches.at(-1), { issue: String(n), mode: "fix", step: "1" });
+
+  // Claude pushes a fix -> re-review requested
+  db.issues[pr1].head.sha = sha("b");
+  await publish(n, "fix", 1);
+  assert.equal(state(n).status, "reviewing");
+  assert.ok(db.comments[pr1].some((c) => c.body === "@codex review"));
+
+  // A stale PASS for the old head must not pass the new head
+  await codexSays(pr1, sha("a"), "completed", false);
+  assert.equal(state(n).status, "reviewing");
+
+  ciPass(sha("b"));
+  await codexSays(pr1, sha("b"), "completed", false);
+  assert.equal(db.issues[pr1].merged_at !== undefined, true, "step PR merged");
+  assert.equal(db.merges.at(-1).sha, sha("b"), "merge pinned to judged head");
+  assert.equal(state(n).status, "implementing");
+  assert.equal(state(n).step, 2);
+  assert.equal(state(n).retries, 0);
+  assert.deepEqual(state(n).passed, { 1: pr1 });
+
+  db.refs[C.stepBranch(n, 2)] = sha("c");
+  await publish(n, "implement", 2);
+  const pr2 = state(n).pr;
+  ciPass(sha("c"));
+  await codexSays(pr2, sha("c"), "completed", false);
+  const st = state(n);
+  assert.equal(st.status, "awaiting_merge");
+  const final = db.issues[st.finalPr];
+  assert.equal(final.base.ref, "main");
+  assert.equal(final.head.ref, C.runBranch(n));
+  assert.match(db.notifications.at(-1).title, /완료/);
+  assert.match(db.issues[n].body, /- \[x\] Step 2\. 스텝2 — 통과/);
+
+  // Owner merges the final PR -> watchdog closes the run
+  final.merged_at = "2026-11-21T00:00:00Z"; final.state = "closed";
+  await fire("schedule", {});
+  assert.equal(state(n).status, "done");
+  assert.equal(db.issues[n].state, "closed");
+  assert.deepEqual(labels(n), ["orch:done"]);
+});
+
+test("retry limit -> blocked with notification; resume restarts the step on a new attempt", async () => {
+  const issue = db.newIssue(plan(1, { max_retries: 1 }));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("d");
+  await publish(n, "implement", 1);
+  const pr = state(n).pr;
+  ciFail(sha("d"));
+  await codexSays(pr, sha("d"), "completed", false);
+  assert.equal(state(n).status, "fixing", "CI failure alone fails the step");
+  db.issues[pr].head.sha = sha("e");
+  await publish(n, "fix", 1);
+  ciFail(sha("e"));
+  await codexSays(pr, sha("e"), "completed", false);
+  assert.equal(state(n).status, "blocked");
+  assert.match(state(n).reason, /2회 연속 실패.*CI 실패: test/);
+  assert.ok(labels(n).includes("orch:blocked"));
+  assert.match(db.notifications.at(-1).title, /중단/);
+
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: db.issues[n] });
+  assert.equal(state(n).status, "implementing");
+  assert.equal(state(n).attempt, 2);
+  assert.equal(db.issues[pr].state, "closed", "old step PR closed on restart");
+  assert.ok(!labels(n).includes("orch:blocked"));
+});
+
+test("Codex failed (usage limit) -> blocked as review; resume re-requests review on same PR", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("f");
+  await publish(n, "implement", 1);
+  const pr = state(n).pr;
+  await codexSays(pr, sha("f"), "failed", true);
+  assert.equal(state(n).status, "blocked");
+  assert.equal(state(n).blockKind, "review");
+  const before = db.comments[pr].filter((c) => c.body === "@codex review").length;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: db.issues[n] });
+  assert.equal(state(n).status, "reviewing");
+  assert.equal(db.comments[pr].filter((c) => c.body === "@codex review").length, before + 1);
+});
+
+test("Claude BLOCKED / no change / work failure -> blocked; untrusted triggers ignored", async () => {
+  const mk = async () => {
+    const issue = db.newIssue(plan(1));
+    await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+    return issue.number;
+  };
+  let n = await mk();
+  await publish(n, "implement", 1, { BLOCKED: "외부 API 키 필요", CHANGED: "false" });
+  assert.match(state(n).reason, /Claude 중단 보고: 외부 API 키 필요/);
+  n = await mk();
+  await publish(n, "implement", 1, { CHANGED: "false" });
+  assert.match(state(n).reason, /변경 사항 없이/);
+  n = await mk();
+  await publish(n, "implement", 1, { WORK_RESULT: "failure" });
+  assert.match(state(n).reason, /실행이 실패/);
+
+  // Label added by someone else, or plan issue written by someone else -> ignored
+  const dispatches = db.dispatches.length;
+  const i1 = db.newIssue(plan(1));
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "mallory" }, issue: i1 });
+  const i2 = db.newIssue(plan(1), { login: "mallory", id: 9, type: "User" });
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: i2 });
+  assert.equal(state(i1.number), null);
+  assert.equal(state(i2.number), null);
+  assert.equal(db.dispatches.length, dispatches);
+
+  // Invalid plan -> explanatory comment, no dispatch
+  const i3 = db.newIssue("```json\n{\"goal\":\"x\",\"steps\":[]}\n```");
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: i3 });
+  assert.match(db.comments[i3.number].at(-1).body, /계획을 읽을 수 없어/);
+  assert.equal(db.dispatches.length, dispatches);
+});
+
+test("stale publish after cancel is a no-op; forged Codex marker is ignored", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("9");
+  await publish(n, "implement", 1);
+  const pr = state(n).pr;
+  ciPass(sha("9"));
+  const forged = db.addComment(pr, `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${sha("9")}","has_unresolved_findings":false,"status":"completed"}} -->`, { login: CODEX.login, id: 5, type: "Bot" });
+  await fire("issue_comment", { action: "created", issue: { number: pr, pull_request: {} }, comment: forged });
+  assert.equal(state(n).status, "reviewing", "forged id does not pass");
+
+  await fire("issues", { action: "labeled", label: { name: "orch:cancel" }, sender: { login: "o" }, issue: db.issues[n] });
+  assert.equal(state(n).status, "cancelled");
+  assert.equal(db.issues[pr].state, "closed");
+  const prs = Object.keys(db.issues).length;
+  await publish(n, "implement", 1);
+  assert.equal(Object.keys(db.issues).length, prs, "no PR created after cancel");
+});

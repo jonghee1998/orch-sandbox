@@ -1,0 +1,8 @@
+{
+  "name": "orch-sandbox",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\" \"scripts/orch/*.test.mjs\""
+  }
+}

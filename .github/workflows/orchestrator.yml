@@ -1,0 +1,58 @@
+# State machine: decides the next step from GitHub state and writes it back to the run Issue.
+# Runs only default-branch code (issues / issue_comment / workflow_run / schedule / workflow_dispatch).
+name: orchestrator
+
+on:
+  issues:
+    types: [labeled, closed]
+  issue_comment:
+    types: [created, edited]          # Codex edits its single summary comment when a review completes
+  workflow_run:
+    workflows: [ci, claude-work]
+    types: [completed]
+  schedule:
+    - cron: "*/20 * * * *"            # watchdog: missed events, Codex nudge, idle timeout, final merge
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  advance:
+    # Job-level (not workflow-level) so that skipped runs never enter the queue and displace a pending writer.
+    concurrency:
+      group: orch-state-${{ github.repository }}   # shared with claude-work/publish: one state writer at a time
+      cancel-in-progress: false
+    if: >-
+      (github.event_name == 'issues' && (
+        github.event.label.name == 'orch:go' ||
+        github.event.label.name == 'orch:cancel' ||
+        (github.event.action == 'closed' && contains(github.event.issue.labels.*.name, 'orch:run')))) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+        github.event.comment.user.login == 'chatgpt-codex-connector[bot]') ||
+      (github.event_name == 'workflow_run' && (
+        github.event.workflow_run.name == 'claude-work' ||
+        startsWith(github.event.workflow_run.head_branch, 'orch/run-'))) ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+      actions: write        # dispatch claude-work (GITHUB_TOKEN may trigger workflow_dispatch)
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: scripts/orch
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/orch/main.mjs event
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+          READ_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}

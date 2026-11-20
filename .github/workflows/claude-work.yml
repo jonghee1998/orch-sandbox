@@ -1,0 +1,111 @@
+# One unit of developer work, dispatched by the orchestrator only.
+#   implement: branch from orch/run-<n>, Claude implements step k, push, open PR
+#   fix:       check out the step PR branch, Claude fixes Codex/CI findings, push, request re-review
+name: claude-work
+run-name: "claude-work #${{ inputs.issue }} ${{ inputs.mode }} step ${{ inputs.step }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue: { required: true, type: string }
+      mode: { required: true, type: choice, options: [implement, fix] }
+      step: { required: true, type: string }
+
+permissions: {}
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    outputs:
+      skip: ${{ steps.prep.outputs.skip }}
+      branch: ${{ steps.prep.outputs.branch }}
+      changed: ${{ steps.commit.outputs.changed }}
+      blocked: ${{ steps.commit.outputs.blocked }}
+      summary: ${{ steps.commit.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT }}     # pushes made with the owner PAT trigger CI and Codex
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Keep a trusted copy of the orchestrator scripts
+        run: cp -r scripts/orch "$RUNNER_TEMP/orch"
+      - name: Prepare branch and prompt
+        id: prep
+        run: |
+          git config user.name "orch-bot"
+          git config user.email "orch-bot@users.noreply.github.com"
+          node "$RUNNER_TEMP/orch/main.mjs" prepare
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+          READ_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+          MODE: ${{ inputs.mode }}
+          STEP: ${{ inputs.step }}
+      - name: Install dependencies
+        if: steps.prep.outputs.skip != 'true'
+        run: if [ -f package-lock.json ]; then npm ci; fi
+      - name: Claude
+        if: steps.prep.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.BOT_PAT }}
+          prompt: ${{ steps.prep.outputs.prompt }}
+          allowed_bots: "*"   # dispatched by the orchestrator (github-actions[bot]); workflow_dispatch needs write access anyway
+          claude_args: >-
+            --max-turns 80
+            ${{ steps.prep.outputs.model_args }}
+            --allowedTools "Edit,Write,Read,Glob,Grep,LS,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*)"
+      - name: Commit and push
+        id: commit
+        if: steps.prep.outputs.skip != 'true'
+        run: node "$RUNNER_TEMP/orch/main.mjs" commit
+        env:
+          ISSUE: ${{ inputs.issue }}
+          MODE: ${{ inputs.mode }}
+          STEP: ${{ inputs.step }}
+          BRANCH: ${{ steps.prep.outputs.branch }}
+          START_SHA: ${{ steps.prep.outputs.start_sha }}
+
+  publish:
+    needs: work
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: orch-state-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: scripts/orch
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/orch/main.mjs publish
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          ISSUE: ${{ inputs.issue }}
+          MODE: ${{ inputs.mode }}
+          STEP: ${{ inputs.step }}
+          WORK_RESULT: ${{ needs.work.result }}
+          SKIP: ${{ needs.work.outputs.skip }}
+          BRANCH: ${{ needs.work.outputs.branch }}
+          CHANGED: ${{ needs.work.outputs.changed }}
+          BLOCKED: ${{ needs.work.outputs.blocked }}
+          SUMMARY: ${{ needs.work.outputs.summary }}
