@@ -187,3 +187,10 @@ test("extractSummary + finalReport + plan options", () => {
   assert.match(rep, /Step 1: ❌ 이메일 발송은 확인 못 함/);
   assert.match(rep, /npm test 통과/, "done_when used as how-to when plan.try is empty");
 });
+
+test("filesSummary: fallback when SUMMARY.md is missing", () => {
+  assert.equal(C.filesSummary([]), "");
+  assert.equal(C.filesSummary(undefined), "");
+  assert.equal(C.filesSummary([{ filename: "src/a.mjs" }, "test/a.test.mjs"]), "- (자동 요약) 바뀐 파일: `src/a.mjs`, `test/a.test.mjs`");
+  assert.match(C.filesSummary(["1", "2", "3", "4", "5", "6", "7"]), /외 2개$/);
+});
