@@ -37,3 +37,22 @@ test("usageBody/readUsage round-trip with human table", () => {
   assert.deepEqual(readUsage(body), u);
   assert.equal(readUsage("nothing"), null);
 });
+
+import { codexQuota } from "./usage.mjs";
+import { normalizeLimits } from "./codex-limits.mjs";
+
+test("codex quota: app-server result normalized (no ids leak), kept on failure, login flag", () => {
+  const n = normalizeLimits({ ordinaryUsageAllowed: false, accountId: "acct_secret", rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1795229741 }, secondary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: 1795481550 } }, rateLimitsByLimitId: { codex_review: { limitName: "Code review", secondary: { usedPercent: 100, resetsAt: 1795481550 } } } });
+  assert.equal(JSON.stringify(n).includes("acct_secret"), false);
+  assert.deepEqual(n.weekly, { pct: 100, windowMins: 10080, resetsAt: "2026-11-24T00:52:30.000Z" });
+  assert.equal(n.byLimit[0].name, "Code review");
+  const ok = codexQuota({ ok: true, ...n }, null, "T1");
+  assert.equal(ok.quota.weekly.pct, 100);
+  assert.equal(ok.needsLogin, false);
+  const kept = codexQuota({ ok: false, needsLogin: true, error: "로그인 필요" }, ok, "T2");
+  assert.equal(kept.quota.weekly.pct, 100, "last good value kept");
+  assert.equal(kept.quotaCheckedAt, "T1");
+  assert.equal(kept.needsLogin, true);
+  assert.equal(codexQuota(null, kept, "T3", "3시간 주기 아님").needsLogin, true, "skipped run keeps login state");
+  assert.equal(codexQuota(null, null, "T3", "로그인 필요").needsLogin, true, "no stored login");
+});

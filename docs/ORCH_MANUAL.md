@@ -127,5 +127,7 @@ PM(Claude)이 1시간마다 점검합니다. 일시적인 문제(Actions 오류,
 
 ### 사용량은 어떻게 재나요
 - `usage` 워크플로가 매시 17분에 돌아요. Claude Code를 Haiku로 한 번("OK" 한 단어) 실행하면 Claude가 돌려주는 한도 정보(5시간·7일 사용률, 리셋 시각)가 나오고, 그걸 `orch:usage` 라벨 Issue에 저장해요. 값은 **구독 계정 전체** 기준이라 직접 대화로 쓴 양도 포함돼요. 전체 일시정지 중에는 확인을 건너뛰고 마지막 값을 유지해요.
-- Codex는 ChatGPT 로그인 토큰 없이는 잔여 %를 알 수 없어서, GitHub 리뷰 기록으로 "한도 소진(최근 24시간 내 한도 응답 후 정상 리뷰 없음)"인지와 마지막 리뷰 시각만 보여줘요.
+- Codex는 3시간마다 공식 `codex app-server`의 `account/rateLimits/read`로 5시간·주간 사용률과 리셋 시각을 읽어요. 이때 필요한 Codex 로그인 정보는 암호화해서(AES-256, 열쇠는 시크릿 `CODEX_AUTH_KEY`) GitHub Actions 캐시에 보관해요. 실행할 때마다 복원 → 조회 → 토큰이 바뀌었으면 다시 암호화해서 저장 → 실행 컴퓨터에서 삭제하는 순서로 돌아요. GitHub 리뷰 기록으로 본 "한도 소진" 여부도 같이 표시해요.
+- **처음 한 번 (폰으로)**: ① 저장소 Settings → Secrets and variables → Actions → New secret → 이름 `CODEX_AUTH_KEY`, 값은 20자 이상 아무 문자열 ② Actions → `codex-login` → Run workflow ③ 실행 요약(또는 `orch:usage` Issue 댓글)에 나온 주소를 열고 코드를 넣어 승인.
+- 로그인이 풀리면 상황판과 `orch:usage` Issue에 "폰 로그인 필요"가 뜨고, ②~③만 다시 하면 돼요. 이 로그인 정보는 사용량 조회에만 쓰여요.
 - 문서화되지 않은 정보라 형식이 바뀌면 "확인 불가"로 표시돼요. 엔진 동작에는 영향이 없어요.

@@ -1,6 +1,7 @@
 // AI usage snapshot for the dashboard (usage.yml, hourly).
 //   Claude: subscription-wide 5h / 7d utilization from a Claude Code `rate_limit_event` (stream-json).
-//   Codex : no quota API without a ChatGPT login token, so we record what GitHub shows:
+//   Codex : 5h / weekly % from `codex app-server` account/rateLimits/read (codex-limits.mjs), using a
+//           login kept encrypted in the Actions cache (usage.yml / codex-login.yml). Plus what GitHub shows:
 //           last review time and whether Codex answered "usage limits" recently.
 // The snapshot lives in one Issue labelled `orch:usage` as <!-- orch-usage:v1 {...} -->.
 //   node scripts/orch/usage.mjs publish <stream-json file | ->
@@ -32,6 +33,17 @@ export function claudeFromStream(text) {
   const w = info.unifiedWindows ?? {};
   const win = (x) => (x ? { pct: pct(x.utilization), resetsAt: iso(x.resetsAt), status: String(x.status ?? "") || null } : null);
   return { status: String(info.status ?? "") || null, fiveHour: win(w.five_hour), sevenDay: win(w.seven_day) };
+}
+
+/** Merge this run's Codex quota read (or its absence) with the previous snapshot. */
+export function codexQuota(read, prev, nowIso, note) {
+  if (read?.ok) return { quota: { allowed: read.allowed ?? null, fiveHour: read.fiveHour ?? null, weekly: read.weekly ?? null, byLimit: read.byLimit ?? [] }, quotaCheckedAt: nowIso, quotaError: null, needsLogin: false };
+  return {
+    quota: prev?.quota ?? null,
+    quotaCheckedAt: prev?.quotaCheckedAt ?? null,
+    quotaError: read?.error ?? note ?? prev?.quotaError ?? null,
+    needsLogin: read ? !!read.needsLogin : note === "로그인 필요" ? true : !!prev?.needsLogin,
+  };
 }
 
 /** Codex activity from PR/issue comments of the trusted bot. */
@@ -66,8 +78,12 @@ export function usageBody(u) {
       : `확인 불가${u.claudeError ? ` (${u.claudeError})` : ""}`,
     `_확인: ${kst(u.claudeCheckedAt)}_`,
     "",
-    "### Codex (GitHub 리뷰 기록 기준 · 잔여 %는 조회 불가)",
-    `- 상태: ${u.codex.limited ? "⚠️ 한도 소진 — Opus가 대체 검수 중" : "정상 또는 확인된 한도 문제 없음"}`,
+    "### Codex",
+    u.codex.quota ? ["| 구간 | 사용률 | 리셋 (한국시간) |", "| --- | --- | --- |", row("5시간", u.codex.quota.fiveHour), row("주간", u.codex.quota.weekly)].join("\n")
+      : "사용률 확인 불가",
+    `_확인: ${kst(u.codex.quotaCheckedAt)}${u.codex.quotaError ? ` · 이번 조회: ${u.codex.quotaError}` : ""}_`,
+    u.codex.needsLogin ? "- 🔑 **폰 로그인 필요** — Actions → `codex-login` → Run workflow 후 이 Issue에 올라오는 코드로 승인" : "",
+    `- 상태: ${u.codex.limited ? "⚠️ 한도 소진 — Opus가 대체 검수 중" : "정상"}`,
     `- 마지막 리뷰 완료: ${kst(u.codex.lastReviewAt)} · 마지막 한도 응답: ${kst(u.codex.lastLimitAt)}`,
     "",
     `<!-- orch-usage:v1 ${JSON.stringify(u)} -->`,
@@ -91,7 +107,12 @@ async function publish(file) {
   const prs = (await gh.get("/pulls?state=all&sort=updated&direction=desc&per_page=15")) ?? [];
   const comments = [];
   for (const pr of prs) comments.push(...((await gh.get(`/issues/${pr.number}/comments?per_page=100`)) ?? []));
-  const codex = codexFromComments(comments, now.getTime());
+  const activity = codexFromComments(comments, now.getTime());
+  let read = null;
+  try { if (env.CODEX_LIMITS_FILE && fs.existsSync(env.CODEX_LIMITS_FILE)) read = JSON.parse(fs.readFileSync(env.CODEX_LIMITS_FILE, "utf8")); } catch { read = null; }
+  const q = codexQuota(read, prev?.codex, now.toISOString(), env.CODEX_NOTE || null);
+  const exhausted = q.quota?.allowed === false || (q.quota?.weekly?.pct ?? 0) >= 100 || (q.quota?.fiveHour?.pct ?? 0) >= 100;
+  const codex = { ...activity, ...q, limited: activity.limited || (!!q.quota && exhausted) };
 
   // Keep the last good Claude value when this probe could not read one (skipped or failed).
   const u = {

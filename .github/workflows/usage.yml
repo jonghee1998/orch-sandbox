@@ -1,7 +1,10 @@
 # Hourly AI usage snapshot for the dashboard (Issue labelled orch:usage).
 #   Claude: one tiny Claude Code call (Haiku, "OK") whose rate_limit_event carries subscription-wide
 #           5h / 7d utilization. Skipped while ORCH_PAUSED is on (last value is kept).
-#   Codex : read from Codex review comments on GitHub (no quota API without a ChatGPT login token).
+#   Codex : every 3 hours, `codex app-server` account/rateLimits/read with a Codex login kept encrypted
+#           (AES-256, key = secret CODEX_AUTH_KEY) in the Actions cache: restore → decrypt → read →
+#           re-encrypt and save only if Codex refreshed the token → delete from the runner.
+#           Log in once from a phone with the codex-login workflow. Plus Codex review comments on GitHub.
 name: usage
 
 on:
@@ -22,6 +25,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: write   # prune old encrypted-login cache entries
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,8 +47,65 @@ jobs:
           esac
           npm i -g @anthropic-ai/claude-code >/dev/null 2>&1
           claude -p "Reply with OK only." --model haiku --max-turns 1 --output-format stream-json --verbose > "$RUNNER_TEMP/usage.jsonl"
+      - name: Codex quota schedule (every 3h)
+        id: codex
+        env:
+          CODEX_AUTH_KEY: ${{ secrets.CODEX_AUTH_KEY }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          hour=$(date -u +%H)
+          if [ "$EVENT" = schedule ] && [ $((10#$hour % 3)) -ne 0 ]; then echo "note=" >> "$GITHUB_OUTPUT"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ -z "$CODEX_AUTH_KEY" ]; then echo "note=CODEX_AUTH_KEY 시크릿 없음" >> "$GITHUB_OUTPUT"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+      - name: Restore encrypted Codex login
+        if: steps.codex.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.orch/codex-auth.enc
+          key: codex-auth-latest
+          restore-keys: codex-auth-
+      - name: Read Codex limits
+        id: codexread
+        if: steps.codex.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          CODEX_AUTH_KEY: ${{ secrets.CODEX_AUTH_KEY }}
+        run: |
+          umask 077
+          if [ ! -f ~/.orch/codex-auth.enc ]; then echo "note=로그인 필요" >> "$GITHUB_OUTPUT"; exit 0; fi
+          mkdir -p ~/.codex
+          if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CODEX_AUTH_KEY -in ~/.orch/codex-auth.enc -out ~/.codex/auth.json 2>/dev/null; then
+            rm -f ~/.codex/auth.json; echo "note=로그인 필요" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          before=$(sha256sum ~/.codex/auth.json | cut -c1-64)
+          npm i -g @openai/codex >/dev/null 2>&1
+          node scripts/orch/codex-limits.mjs "$RUNNER_TEMP/codex-limits.json"
+          after=$(sha256sum ~/.codex/auth.json 2>/dev/null | cut -c1-64)
+          if [ -n "$after" ] && [ "$before" != "$after" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CODEX_AUTH_KEY -in ~/.codex/auth.json -out ~/.orch/codex-auth.enc
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Remove Codex credentials from the runner
+        if: always()
+        run: rm -rf ~/.codex
+      - name: Save refreshed encrypted login
+        if: steps.codexread.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.orch/codex-auth.enc
+          key: codex-auth-${{ github.run_id }}
+      - name: Prune old login cache entries
+        if: steps.codexread.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: codex-auth-${{ github.run_id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=codex-auth-&per_page=100" --jq '.actions_caches[] | select(.key != env.KEEP) | .id' \
+            | while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent || true; done
       - name: Publish snapshot
         run: node scripts/orch/usage.mjs publish "$RUNNER_TEMP/usage.jsonl"
         env:
           GH_WRITE_TOKEN: ${{ github.token }}
           PROBE_NOTE: ${{ steps.probe.outputs.note || (steps.probe.outcome == 'failure' && 'Claude 실행 실패' || '') }}
+          CODEX_LIMITS_FILE: ${{ runner.temp }}/codex-limits.json
+          CODEX_NOTE: ${{ steps.codex.outputs.note || steps.codexread.outputs.note || (steps.codexread.outcome == 'failure' && '조회 실패' || '') }}
