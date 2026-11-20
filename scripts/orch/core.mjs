@@ -19,7 +19,7 @@ export const LABELS = Object.freeze({
 export const LOG_MARK = "<!-- orch:log -->";
 export const PROTECTED_PATHS = [/^\.github\//, /^scripts\/orch\//];
 export const MAX_STEPS = 10;
-export const DEFAULT_MAX_RETRIES = 2;
+export const DEFAULT_MAX_RETRIES = 3;
 
 export const runBranch = (n) => `orch/run-${n}`;
 export const stepBranch = (n, step, attempt = 1) =>
@@ -116,6 +116,75 @@ export function pickModel(plan, stepId, retries = 0) {
   return { model, why };
 }
 
+// ---------------------------------------------------------------- ON/OFF switches
+//
+// Read from repository variables (Settings → Secrets and variables → Actions → Variables), passed in as env:
+//   ORCH_SONNET / ORCH_OPUS / ORCH_CODEX  on|off   (unset = on)
+//   ORCH_PAUSED                            on|off   (on = no new work at all; unset = off)
+//   ORCH_WINDOW                            "HH:MM-HH:MM" in Asia/Seoul, e.g. "08:00-23:30" or "22:00-06:00" (unset = always)
+// Switches gate only NEW dispatches (implement / fix / fallback review). Work already running drains.
+
+const OFF_RE = /^(off|false|0|no|disabled?)$/i;
+const ON_RE = /^(on|true|1|yes|enabled?)$/i;
+const flag = (v, dflt) => {
+  const t = String(v ?? "").trim();
+  if (!t) return dflt;
+  if (OFF_RE.test(t)) return false;
+  if (ON_RE.test(t)) return true;
+  return dflt;
+};
+
+export function readSwitches(e = {}) {
+  return {
+    sonnet: flag(e.ORCH_SONNET, true),
+    opus: flag(e.ORCH_OPUS, true),
+    codex: flag(e.ORCH_CODEX, true),
+    paused: flag(e.ORCH_PAUSED, false),
+    window: String(e.ORCH_WINDOW ?? "").trim(),
+  };
+}
+
+const WINDOW_RE = /^([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-4]):([0-5]\d)$/;
+/** Is nowMs inside "HH:MM-HH:MM" (Asia/Seoul)? Empty → always open. Invalid → closed (fail closed). Wraps past midnight. */
+export function windowOpen(window, nowMs = Date.now()) {
+  if (!window) return true;
+  const m = WINDOW_RE.exec(window);
+  if (!m) return false;
+  const a = Number(m[1]) * 60 + Number(m[2]), b = Number(m[3]) * 60 + Number(m[4]);
+  const kst = new Date(nowMs + 9 * 3600 * 1000);
+  const t = kst.getUTCHours() * 60 + kst.getUTCMinutes();
+  if (a === b) return true;
+  return a < b ? t >= a && t < b : t >= a || t < b;
+}
+
+/** Reason new work may not start right now, or null. */
+export function gateReason(sw, nowMs = Date.now()) {
+  if (sw.paused) return "전체 일시정지(ORCH_PAUSED) 상태";
+  if (!windowOpen(sw.window, nowMs)) return `작업 시간대(${sw.window}, 한국시간) 밖`;
+  return null;
+}
+
+const isHeavy = (model) => /opus/i.test(model);
+
+/**
+ * Apply ON/OFF switches to a picked model.
+ * @returns {{model: string, why: string} | {hold: string}}
+ */
+export function resolveModel(pick, sw) {
+  const heavy = isHeavy(pick.model);
+  if (heavy ? sw.opus : sw.sonnet) return pick;
+  if (heavy && sw.sonnet) return { model: MODEL_LIGHT, why: `${pick.why} → Opus OFF라 Sonnet` };
+  if (!heavy && sw.opus) return { model: MODEL_HEAVY, why: `${pick.why} → Sonnet OFF라 Opus` };
+  return { hold: "Sonnet·Opus가 모두 OFF" };
+}
+
+/** Who reviews a step PR given the switches: codex first, Opus fallback. */
+export function reviewRoute(sw, codexUnavailable) {
+  if (sw.codex && !codexUnavailable) return "codex";
+  if (sw.opus) return "claude";
+  return null; // nobody can review
+}
+
 // ---------------------------------------------------------------- state marker + board
 
 const STATE_RE = /<!-- orch-state:v1 ([\s\S]*?) -->/;
@@ -180,7 +249,8 @@ export function renderBoard(plan, state, now = new Date()) {
     }
     return `- [ ] Step ${s.id}. ${s.title}`;
   });
-  const reason = st.status === "blocked" && st.reason ? `\n> 중단 사유: ${oneLine(st.reason, 300)}` : "";
+  const reason = st.status === "blocked" && st.reason ? `\n> 중단 사유: ${oneLine(st.reason, 300)}`
+    : st.held ? `\n> ⏸️ 대기 중: ${oneLine(st.held.reason, 200)} (스위치가 켜지면 자동으로 이어감)` : "";
   return [
     "---",
     "### 진행 상황 (orchestrator)",
@@ -361,6 +431,7 @@ export const RISK_RULES = [
   { re: /^scripts\/orch\//, reason: "오케스트레이터 자체 변경" },
   { re: /(^|\/)(vercel\.json|netlify\.toml|Dockerfile|docker-compose\.ya?ml|fly\.toml|wrangler\.toml|next\.config\.[mc]?[jt]s)$/i, reason: "배포·빌드 설정 변경" },
   { re: /(^|\/)\.env/i, reason: "환경변수 파일" },
+  { re: /(^|\/)certs?\//i, reason: "인증서 파일" },
   { re: /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|poetry\.lock|go\.sum|Cargo\.lock)$/i, reason: "의존성 잠금 파일 변경" },
 ];
 export const MAX_LOW_RISK_FILES = 40;

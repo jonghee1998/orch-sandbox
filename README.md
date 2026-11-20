@@ -44,8 +44,10 @@ orch:go ─▶ Claude 구현 (orch/run-N-step-K) ─▶ PR → orch/run-N
 
 판정 규칙
 - **PASS**: 현재 PR head SHA에 대한 Codex 리뷰가 `completed` + `has_unresolved_findings=false`이고, CI가 실패하지 않음.
-- **FAIL**: Codex 미해결 지적이 있거나 CI 실패 → Claude에게 수정 요청 (`max_retries` 기본 2회).
+- **FAIL**: Codex 미해결 지적이 있거나 CI 실패 → Claude에게 수정 요청 (`max_retries` 기본 3회).
 - **중단**: 수정 한도 초과, Claude가 `.orch/BLOCKED.md` 보고, 변경 없음, Codex 리뷰 실패(사용량 한도), 응답 없음(구현 75분 / 검증 120분).
+
+**ON/OFF 스위치**: 저장소 변수 `ORCH_SONNET` / `ORCH_OPUS` / `ORCH_CODEX` / `ORCH_PAUSED` / `ORCH_WINDOW`로 새 작업을 막거나 대체 경로로 돌립니다. 실행 중인 작업은 끝까지 마칩니다. 자세한 사용법은 [운영 매뉴얼](docs/ORCH_MANUAL.md).
 
 **구현 모델 선택** (스텝마다): `steps[].model` → 계획의 `model` → 자동 순으로 정합니다. 자동이면 스텝 제목·내용에 DB·인증·결제·권한·보안·배포 관련 말이 있을 때 Opus, 아니면 Sonnet을 씁니다. Sonnet으로 검수에 2번 실패한 스텝은 다음 수정부터 Opus로 올립니다. 완공 보고서의 '검사 결과' 표에 스텝별 구현 모델이 나옵니다.
 

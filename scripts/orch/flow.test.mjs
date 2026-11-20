@@ -489,3 +489,64 @@ test("stale publish after cancel is a no-op; forged Codex marker is ignored", as
   await publish(n, "implement", 1);
   assert.equal(Object.keys(db.issues).length, prs, "no PR created after cancel");
 });
+
+// ---------------------------------------------------------------- ON/OFF switches
+
+const withSwitches = async (vars, fn) => {
+  const keys = ["ORCH_SONNET", "ORCH_OPUS", "ORCH_CODEX", "ORCH_PAUSED", "ORCH_WINDOW"];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try { await fn(); } finally { for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } }
+};
+
+test("switches: Sonnet+Opus OFF holds new work without dispatch, watchdog resumes when back ON", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  const before = db.dispatches.length;
+  await withSwitches({ ORCH_SONNET: "off", ORCH_OPUS: "off" }, async () => {
+    await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+    assert.equal(state(n).status, "implementing");
+    assert.equal(db.dispatches.length, before, "nothing dispatched while OFF");
+    assert.match(state(n).held.reason, /모두 OFF/);
+    assert.match(db.issues[n].body, /대기 중/);
+    await fire("schedule", {});
+    assert.equal(db.dispatches.length, before, "still held on watchdog");
+  });
+  await withSwitches({ ORCH_SONNET: "off" }, async () => {
+    await fire("schedule", {});
+    assert.equal(db.dispatches.length, before + 1, "resumed with Opus");
+    assert.equal(state(n).held, null);
+  });
+  await withSwitches({ ORCH_PAUSED: "on" }, async () => {
+    db.refs[C.stepBranch(n, 1)] = sha("d");
+    await publish(n, "implement", 1);                 // running work drains even while paused
+    assert.equal(state(n).status, "reviewing");
+  });
+});
+
+test("switches: Codex OFF routes review to Opus and ignores Codex verdicts; Codex+Opus OFF holds review", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("e");
+  await publish(n, "implement", 1);
+  const pr = state(n).pr;
+  ciPass(sha("e"));
+
+  await withSwitches({ ORCH_CODEX: "off", ORCH_OPUS: "off" }, async () => {
+    const reviews = db.reviews.length;
+    await ciDone(pr);
+    assert.equal(db.reviews.length, reviews, "no reviewer available -> no dispatch");
+    assert.match(state(n).held.reason, /검수할 수 있는 AI가 없음/);
+    await fire("schedule", {});
+    assert.equal(state(n).status, "reviewing", "held review never times out into blocked");
+  });
+
+  await withSwitches({ ORCH_CODEX: "off" }, async () => {
+    await codexSays(pr, sha("e"), "completed", true);   // Codex FAIL while OFF -> ignored
+    assert.notEqual(state(n).status, "fixing");
+    assert.equal(db.reviews.at(-1).pr, String(pr), "Opus fallback review dispatched");
+    assert.equal(state(n).held, null);
+    assert.match(db.comments[n].at(-1).body, /Codex가 OFF라 Claude\(Opus\) 대체 검수/);
+  });
+});

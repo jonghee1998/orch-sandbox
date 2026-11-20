@@ -22,7 +22,7 @@ const issueBody = `설명\n\n\`\`\`json\n${JSON.stringify(planJson, null, 2)}\n\
 test("parsePlan: valid plan with defaults", () => {
   const r = C.parsePlan(issueBody);
   assert.equal(r.ok, true);
-  assert.equal(r.plan.max_retries, 2);
+  assert.equal(r.plan.max_retries, 3);
   assert.deepEqual(r.plan.steps[0].stop_if, []);
   assert.equal(r.plan.model, null);
 });
@@ -206,4 +206,32 @@ test("filesSummary: fallback when SUMMARY.md is missing", () => {
   assert.equal(C.filesSummary(undefined), "");
   assert.equal(C.filesSummary([{ filename: "src/a.mjs" }, "test/a.test.mjs"]), "- (자동 요약) 바뀐 파일: `src/a.mjs`, `test/a.test.mjs`");
   assert.match(C.filesSummary(["1", "2", "3", "4", "5", "6", "7"]), /외 2개$/);
+});
+
+test("switches: parsing, time window (KST, wraps midnight, fail-closed), model resolution", () => {
+  assert.deepEqual(C.readSwitches({}), { sonnet: true, opus: true, codex: true, paused: false, window: "" });
+  assert.deepEqual(C.readSwitches({ ORCH_SONNET: "OFF", ORCH_OPUS: "false", ORCH_CODEX: "0", ORCH_PAUSED: "on" }),
+    { sonnet: false, opus: false, codex: false, paused: true, window: "" });
+  assert.equal(C.readSwitches({ ORCH_CODEX: "maybe" }).codex, true, "unknown value keeps default");
+  const at = (hhmm) => Date.parse(`2026-11-20T${hhmm}:00+09:00`);
+  assert.equal(C.windowOpen("", at("03:00")), true);
+  assert.equal(C.windowOpen("09:00-18:00", at("09:00")), true);
+  assert.equal(C.windowOpen("09:00-18:00", at("18:00")), false);
+  assert.equal(C.windowOpen("22:00-06:00", at("23:30")), true);
+  assert.equal(C.windowOpen("22:00-06:00", at("05:59")), true);
+  assert.equal(C.windowOpen("22:00-06:00", at("12:00")), false);
+  assert.equal(C.windowOpen("08:00-24:00", at("23:59")), true);
+  assert.equal(C.windowOpen("bogus", at("12:00")), false, "invalid window fails closed");
+  assert.match(C.gateReason({ paused: true, window: "" }), /일시정지/);
+  assert.match(C.gateReason({ paused: false, window: "09:00-10:00" }, at("12:00")), /시간대/);
+  assert.equal(C.gateReason({ paused: false, window: "" }), null);
+  const on = { sonnet: true, opus: true };
+  assert.equal(C.resolveModel({ model: "opus", why: "a" }, on).model, "opus");
+  assert.equal(C.resolveModel({ model: "opus", why: "a" }, { sonnet: true, opus: false }).model, "sonnet");
+  assert.equal(C.resolveModel({ model: "sonnet", why: "a" }, { sonnet: false, opus: true }).model, "opus");
+  assert.ok(C.resolveModel({ model: "claude-opus-5-5", why: "a" }, { sonnet: false, opus: false }).hold);
+  assert.equal(C.reviewRoute({ codex: true, opus: true }, false), "codex");
+  assert.equal(C.reviewRoute({ codex: true, opus: true }, true), "claude");
+  assert.equal(C.reviewRoute({ codex: false, opus: true }, false), "claude");
+  assert.equal(C.reviewRoute({ codex: false, opus: false }, false), null);
 });

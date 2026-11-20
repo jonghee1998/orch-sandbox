@@ -66,3 +66,9 @@ jobs:
           READ_TOKEN: ${{ github.token }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           INPUT_PR: ${{ inputs.pr }}
+          # ON/OFF switches (repository variables; unset = default)
+          ORCH_SONNET: ${{ vars.ORCH_SONNET }}
+          ORCH_OPUS: ${{ vars.ORCH_OPUS }}
+          ORCH_CODEX: ${{ vars.ORCH_CODEX }}
+          ORCH_PAUSED: ${{ vars.ORCH_PAUSED }}
+          ORCH_WINDOW: ${{ vars.ORCH_WINDOW }}
