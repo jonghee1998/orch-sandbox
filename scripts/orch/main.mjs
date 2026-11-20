@@ -195,7 +195,7 @@ async function cancel(run, sender, why) {
 
 // ---------------------------------------------------------------- review evaluation
 
-async function evaluatePR(prNumber) {
+async function evaluatePR(prNumber, { reviewRunFailed = false } = {}) {
   const pr = await gh().get(`/pulls/${prNumber}`, { allow404: true });
   if (!pr || pr.state !== "open" || pr.user.login !== OWNER) return;
   const link = C.parsePrMarker(pr.body);
@@ -216,6 +216,9 @@ async function evaluatePR(prNumber) {
     const cr = C.claudeReviewVerdict(comments, pr.head.sha);
     log(`PR #${pr.number}: codex=error(${codex.status}) -> claude review ${cr.result}`);
     if (cr.result === "none") {
+      if (reviewRunFailed && st.claudeReviewFor === pr.head.sha) {
+        return block(run, "Claude 대체 검수 워크플로가 판정 없이 실패했습니다.", pr.html_url, "review");
+      }
       if (st.claudeReviewFor !== pr.head.sha) {
         await ro().post("/actions/workflows/claude-review.yml/dispatches", {
           ref: "main",
@@ -367,7 +370,7 @@ async function onEvent() {
     const wr = ev.workflow_run;
     if (wr.name === "claude-review") {
       const m = /#(\d+) pr (\d+)/.exec(wr.display_title ?? "");
-      return m ? evaluatePR(Number(m[2])) : undefined;
+      return m ? evaluatePR(Number(m[2]), { reviewRunFailed: wr.conclusion !== "success" }) : undefined;
     }
     if (wr.name === "claude-work") {
       // The publish job handles normal results. This only catches a run cancelled before publish could act.

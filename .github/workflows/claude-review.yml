@@ -20,8 +20,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      issues: write          # post the verdict comment
-      pull-requests: read
+      issues: write
+      pull-requests: write   # commenting on a PR (issues API) needs this
       id-token: write
     steps:
       - name: PR commit under review

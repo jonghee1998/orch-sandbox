@@ -299,6 +299,21 @@ test("fallback review ERROR -> blocked as review; resume re-requests Codex", asy
   assert.equal(db.comments[pr].filter((c) => c.body === "@codex review").length, before + 1);
 });
 
+test("fallback review workflow fails without a verdict -> blocked (no silent wait)", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("5");
+  await publish(n, "implement", 1);
+  const pr = state(n).pr;
+  ciPass(sha("5"));
+  await codexSays(pr, sha("5"), "failed", true);
+  assert.equal(state(n).claudeReviewFor, sha("5"));
+  await fire("workflow_run", { workflow_run: { name: "claude-review", display_title: `claude-review #${n} pr ${pr}`, conclusion: "failure" } });
+  assert.equal(state(n).status, "blocked");
+  assert.match(state(n).reason, /판정 없이 실패/);
+});
+
 test("Claude BLOCKED / no change / work failure -> blocked; untrusted triggers ignored", async () => {
   const mk = async () => {
     const issue = db.newIssue(plan(1));
