@@ -57,8 +57,8 @@ async function notify(title, message, url) {
 
 // ---------------------------------------------------------------- run I/O
 
-async function loadRun(n) {
-  const issue = await gh().get(`/issues/${n}`, { allow404: true });
+async function loadRun(n, c = gh()) {
+  const issue = await c.get(`/issues/${n}`, { allow404: true });
   if (!issue || issue.pull_request) return null;
   const parsed = C.parsePlan(issue.body);
   return {
@@ -149,7 +149,7 @@ async function start(run, sender) {
   if (st?.status === "blocked") {
     const pr = st.pr ? await gh().get(`/pulls/${st.pr}`, { allow404: true }) : null;
     if (st.blockKind === "review" && pr?.state === "open") {
-      await save(run, { status: "reviewing", reason: null, reviewRequestedAt: now(), nudged: [pr.head.sha] },
+      await save(run, { status: "reviewing", reason: null, reviewRequestedAt: now(), nudged: [pr.head.sha], claudeReviewFor: null },
         `▶️ 재개: PR #${pr.number} 재검증을 요청했습니다.`);
       await gh().post(`/issues/${pr.number}/comments`, { body: "@codex review" });
     } else {
@@ -209,10 +209,31 @@ async function evaluatePR(prNumber) {
   const comments = await gh().all(`/issues/${pr.number}/comments`);
   const codex = C.codexVerdict(comments, pr.head.sha);
   const ci = C.ciVerdict(await ro().all(`/commits/${pr.head.sha}/check-runs`), SELF_CHECKS);
-  const d = C.decide(codex, ci, { requireCi: env.REQUIRE_CI !== "false" });
-  log(`PR #${pr.number} head ${pr.head.sha.slice(0, 7)}: codex=${codex.result} ci=${ci.result} -> ${d.action}`);
 
-  if (d.action === "wait") return { run, pr, codex };
+  // Codex unavailable (e.g. usage limit) -> independent Claude (Opus) review in a separate workflow.
+  let review = codex;
+  if (codex.result === "error") {
+    const cr = C.claudeReviewVerdict(comments, pr.head.sha);
+    log(`PR #${pr.number}: codex=error(${codex.status}) -> claude review ${cr.result}`);
+    if (cr.result === "none") {
+      if (st.claudeReviewFor !== pr.head.sha) {
+        await ro().post("/actions/workflows/claude-review.yml/dispatches", {
+          ref: "main",
+          inputs: { issue: String(run.n), pr: String(pr.number), sha: pr.head.sha },
+        });
+        await save(run, { claudeReviewFor: pr.head.sha, reviewRequestedAt: now() },
+          `🔁 Codex 리뷰를 쓸 수 없어(status=${codex.status}) Claude(Opus) 대체 검수를 요청했습니다 (PR #${pr.number}).`);
+      }
+      return { run, pr, codex, fallback: true };
+    }
+    if (cr.result === "error") return block(run, "Claude 대체 검수가 판정을 내지 못했습니다.", cr.url ?? pr.html_url, "review");
+    review = cr;
+  }
+
+  const d = C.decide(review, ci, { requireCi: env.REQUIRE_CI !== "false" });
+  log(`PR #${pr.number} head ${pr.head.sha.slice(0, 7)}: review=${review.source ?? "codex"}:${review.result} ci=${ci.result} -> ${d.action}`);
+
+  if (d.action === "wait") return { run, pr, codex, fallback: review !== codex };
   if (d.action === "block") return block(run, d.reason, codex.url ?? pr.html_url, "review");
   if (d.action === "pass") return onPass(run, pr);
   return onFail(run, pr, d.reason);
@@ -286,7 +307,7 @@ async function watchOne(n) {
     if (run.state.status !== "reviewing" || !r) return;
     const head = r.pr.head.sha;
     const nudged = run.state.nudged ?? [];
-    if (r.codex.result === "none" && minutesSince(run.state.reviewRequestedAt) > NUDGE_AFTER_MIN && !nudged.includes(head)) {
+    if (!r.fallback && r.codex.result === "none" && minutesSince(run.state.reviewRequestedAt) > NUDGE_AFTER_MIN && !nudged.includes(head)) {
       await gh().post(`/issues/${st.pr}/comments`, { body: "@codex review" });
       await save(run, { nudged: [...nudged, head] }, `🔔 ${NUDGE_AFTER_MIN}분 동안 Codex 판정이 없어 리뷰를 다시 요청했습니다 (PR #${st.pr}).`);
       return;
@@ -344,6 +365,10 @@ async function onEvent() {
 
   if (name === "workflow_run") {
     const wr = ev.workflow_run;
+    if (wr.name === "claude-review") {
+      const m = /#(\d+) pr (\d+)/.exec(wr.display_title ?? "");
+      return m ? evaluatePR(Number(m[2])) : undefined;
+    }
     if (wr.name === "claude-work") {
       // The publish job handles normal results. This only catches a run cancelled before publish could act.
       const m = /#(\d+) /.exec(wr.display_title ?? "");
@@ -396,6 +421,11 @@ async function prepare() {
     const reviews = (await gh().all(`/pulls/${pr.number}/reviews`))
       .filter((r) => C.isTrustedCodex(r.user) && r.commit_id === head)
       .map((r) => r.body ?? "");
+    const cr = C.claudeReviewVerdict(await gh().all(`/issues/${pr.number}/comments`), head);
+    if (cr.result === "fail") {
+      inline.push(...cr.findings.map((f) => ({ path: f.path, line: f.line, body: f.body })));
+      if (cr.summary) reviews.push(`(Claude 대체 검수) ${cr.summary}`);
+    }
     const ci = C.ciVerdict(await ro().all(`/commits/${head}/check-runs`), SELF_CHECKS);
     prompt = C.fixPrompt(run.plan, step, {
       round: st.retries, maxRetries: run.plan.max_retries, findings: inline, reviewBodies: reviews, ciFailed: ci.failed,
@@ -506,7 +536,39 @@ async function publish() {
 
 // ---------------------------------------------------------------- main
 
-export const commands = { event: onEvent, prepare, commit: commitAndPush, publish, watchdog };
+// ---------------------------------------------------------------- claude-review: prepare / publish
+// Runs with the workflow GITHUB_TOKEN only (no owner PAT): reads the plan, posts one verdict comment.
+
+async function reviewPrepare() {
+  const n = Number(env.ISSUE), prNumber = Number(env.PR), sha = env.SHA;
+  const run = await loadRun(n, ro());
+  const st = run?.state;
+  const pr = await ro().get(`/pulls/${prNumber}`, { allow404: true });
+  if (!run?.plan || !st || st.status !== "reviewing" || st.pr !== prNumber || pr?.head.sha !== sha) {
+    log(`skip review: state=${st?.status} pr=${st?.pr} head=${pr?.head.sha?.slice(0, 7)}`);
+    setOutput("skip", "true");
+    return;
+  }
+  setOutput("skip", "false");
+  setOutput("prompt", C.reviewPrompt(run.plan, st.step, `origin/${pr.base.ref}`));
+}
+
+async function reviewPublish() {
+  if (env.SKIP === "true") return;
+  const sha = env.SHA;
+  let parsed = null;
+  try {
+    parsed = env.CLAUDE_OUTCOME === "success" ? C.parseReviewFile(fs.readFileSync(".orch/REVIEW.json", "utf8")) : null;
+  } catch { parsed = null; }
+  const verdict = parsed?.verdict ?? "ERROR";
+  const summary = parsed?.summary ?? `검수 결과 파일이 없거나 형식이 잘못되었습니다 (Claude 실행 결과: ${env.CLAUDE_OUTCOME}).`;
+  await ro().post(`/issues/${env.PR}/comments`, {
+    body: C.claudeReviewComment({ sha, verdict, summary, findings: parsed?.findings ?? [], runUrl: RUN_URL }),
+  });
+  log(`claude review ${verdict} for ${sha.slice(0, 7)}`);
+}
+
+export const commands = { event: onEvent, prepare, commit: commitAndPush, publish, watchdog, "review-prepare": reviewPrepare, "review-publish": reviewPublish };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const cmd = process.argv[2];

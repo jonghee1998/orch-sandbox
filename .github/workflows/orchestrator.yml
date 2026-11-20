@@ -8,7 +8,7 @@ on:
   issue_comment:
     types: [created, edited]          # Codex edits its single summary comment when a review completes
   workflow_run:
-    workflows: [ci, claude-work]
+    workflows: [ci, claude-work, claude-review]
     types: [completed]
   schedule:
     - cron: "*/20 * * * *"            # watchdog: missed events, Codex nudge, idle timeout, final merge
@@ -31,6 +31,7 @@ jobs:
         github.event.comment.user.login == 'chatgpt-codex-connector[bot]') ||
       (github.event_name == 'workflow_run' && (
         github.event.workflow_run.name == 'claude-work' ||
+        github.event.workflow_run.name == 'claude-review' ||
         startsWith(github.event.workflow_run.head_branch, 'orch/run-'))) ||
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch'

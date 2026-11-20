@@ -136,3 +136,23 @@ test("prompts include the step, criteria, findings and rules", () => {
   assert.match(p2, /src\/text\.mjs:4` — null 처리 누락/);
   assert.match(p2, /- test: u/);
 });
+
+test("Claude fallback review: trust, exact SHA, file validation", () => {
+  const ACT = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
+  const body = (sha_, v) => C.claudeReviewComment({ sha: sha_, verdict: v, summary: "x --> y", findings: [], runUrl: "u" });
+  const c = (b, user = ACT, at = "2026-11-20T10:00:00Z") => ({ user, body: b, updated_at: at });
+  assert.equal(C.claudeReviewVerdict([c(body(SHA, "PASS"))], SHA).result, "pass");
+  assert.equal(C.claudeReviewVerdict([c(body(SHA, "FAIL"))], SHA).result, "fail");
+  assert.equal(C.claudeReviewVerdict([c(body(SHA, "ERROR"))], SHA).result, "error");
+  assert.equal(C.claudeReviewVerdict([c(body(SHA2, "PASS"))], SHA).result, "none", "other sha");
+  assert.equal(C.claudeReviewVerdict([c(body(SHA, "PASS"), { ...ACT, id: 1 })], SHA).result, "none", "forged id");
+  assert.equal(C.claudeReviewVerdict([c(body(SHA, "PASS"), { login: "jonghee1998", id: 1, type: "User" })], SHA).result, "none");
+  assert.equal(C.claudeReviewVerdict([c(body(SHA, "PASS"), ACT, "1"), c(body(SHA, "FAIL"), ACT, "2")], SHA).result, "fail", "latest wins");
+
+  assert.deepEqual(C.parseReviewFile('{"verdict":"PASS","summary":"ok","findings":[]}'), { verdict: "PASS", summary: "ok", findings: [] });
+  assert.equal(C.parseReviewFile('{"verdict":"FAIL","findings":[]}'), null, "FAIL needs findings");
+  assert.equal(C.parseReviewFile('{"verdict":"MAYBE"}'), null);
+  assert.equal(C.parseReviewFile("not json"), null);
+  assert.equal(C.parseReviewFile('{"verdict":"FAIL","findings":[{"path":"a","line":2,"body":"b"}]}').findings[0].line, 2);
+  assert.match(C.reviewPrompt(C.parsePlan(issueBody).plan, 1, "origin/orch/run-1"), /git diff origin\/orch\/run-1\.\.\.HEAD/);
+});

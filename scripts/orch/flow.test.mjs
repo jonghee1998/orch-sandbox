@@ -11,7 +11,7 @@ const CODEX = { login: C.CODEX_BOT.login, id: C.CODEX_BOT.id, type: "Bot" };
 const sha = (c) => c.repeat(40);
 
 function fakeGitHub() {
-  const db = { seq: 0, issues: {}, comments: {}, labels: new Set(), refs: { main: sha("0") }, dispatches: [], checks: {}, notifications: [], merges: [] };
+  const db = { seq: 0, issues: {}, comments: {}, labels: new Set(), refs: { main: sha("0") }, dispatches: [], checks: {}, notifications: [], merges: [], reviews: [] };
   let clock = Date.parse("2026-11-20T00:00:00Z");
   const ts = () => new Date((clock += 1000)).toISOString();
   const json = (status, body) => new Response(body === undefined ? null : JSON.stringify(body), {
@@ -97,6 +97,7 @@ function fakeGitHub() {
     if (/^\/pulls\/\d+\/(comments|reviews)$/.test(p)) return paged([]);
     if ((m = /^\/commits\/([a-f0-9]+)\/check-runs$/.exec(p))) return json(200, { check_runs: page > 1 ? [] : db.checks[m[1]] ?? [] });
     if (p === "/actions/workflows/claude-work.yml/dispatches") { db.dispatches.push(body.inputs); return json(204); }
+    if (p === "/actions/workflows/claude-review.yml/dispatches") { db.reviews.push(body.inputs); return json(204); }
     if (p === "/actions/workflows/claude-work.yml/runs") return json(200, { workflow_runs: [] });
     throw new Error(`fake GitHub: unhandled ${method} ${p}`);
   }
@@ -240,19 +241,61 @@ test("retry limit -> blocked with notification; resume restarts the step on a ne
   assert.ok(!labels(n).includes("orch:blocked"));
 });
 
-test("Codex failed (usage limit) -> blocked as review; resume re-requests review on same PR", async () => {
+const ACTIONS = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
+const claudeReviewSays = (pr, headSha, verdict, findings = []) => {
+  db.addComment(pr, C.claudeReviewComment({ sha: headSha, verdict, summary: "s", findings, runUrl: "u" }), ACTIONS);
+  return fire("workflow_run", { workflow_run: { name: "claude-review", display_title: `claude-review #0 pr ${pr}`, conclusion: "success" } });
+};
+
+test("Codex failed (usage limit) -> Claude fallback review once -> FAIL -> fix -> fallback PASS -> done", async () => {
   const issue = db.newIssue(plan(1));
   const n = issue.number;
   await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
   db.refs[C.stepBranch(n, 1)] = sha("f");
   await publish(n, "implement", 1);
   const pr = state(n).pr;
+  ciPass(sha("f"));
   await codexSays(pr, sha("f"), "failed", true);
+  assert.equal(state(n).status, "reviewing", "not blocked: fallback instead");
+  assert.deepEqual(db.reviews.at(-1), { issue: String(n), pr: String(pr), sha: sha("f") });
+  const reviews = db.reviews.length;
+  await codexSays(pr, sha("f"), "failed", true);          // repeated event -> no duplicate dispatch
+  assert.equal(db.reviews.length, reviews);
+
+  // A PASS-looking marker from the owner account (e.g. written by the implementing job) is not trusted
+  db.addComment(pr, C.claudeReviewComment({ sha: sha("f"), verdict: "PASS", summary: "", findings: [], runUrl: "u" }), OWNER);
+  await fire("workflow_run", { workflow_run: { name: "claude-review", display_title: `claude-review #${n} pr ${pr}`, conclusion: "success" } });
+  assert.equal(state(n).status, "reviewing");
+
+  await claudeReviewSays(pr, sha("f"), "FAIL", [{ path: "src/text.mjs", line: 3, body: "null 처리 누락" }]);
+  assert.equal(state(n).status, "fixing");
+  assert.match(db.comments[n].at(-1).body, /Claude 대체 검수 FAIL/);
+
+  db.issues[pr].head.sha = sha("7");
+  await publish(n, "fix", 1);
+  ciPass(sha("7"));
+  await codexSays(pr, sha("7"), "failed", true);
+  assert.equal(db.reviews.at(-1).sha, sha("7"), "new head gets its own fallback review");
+  await claudeReviewSays(pr, sha("7"), "PASS");
+  assert.equal(state(n).status, "awaiting_merge");
+});
+
+test("fallback review ERROR -> blocked as review; resume re-requests Codex", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("6");
+  await publish(n, "implement", 1);
+  const pr = state(n).pr;
+  ciPass(sha("6"));
+  await codexSays(pr, sha("6"), "failed", true);
+  await claudeReviewSays(pr, sha("6"), "ERROR");
   assert.equal(state(n).status, "blocked");
   assert.equal(state(n).blockKind, "review");
   const before = db.comments[pr].filter((c) => c.body === "@codex review").length;
   await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: db.issues[n] });
   assert.equal(state(n).status, "reviewing");
+  assert.equal(state(n).claudeReviewFor, null);
   assert.equal(db.comments[pr].filter((c) => c.body === "@codex review").length, before + 1);
 });
 

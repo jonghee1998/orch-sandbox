@@ -40,6 +40,8 @@ orch:go ─▶ Claude 구현 (orch/run-N-step-K) ─▶ PR → orch/run-N
 - **FAIL**: Codex 미해결 지적이 있거나 CI 실패 → Claude에게 수정 요청 (`max_retries` 기본 2회).
 - **중단**: 수정 한도 초과, Claude가 `.orch/BLOCKED.md` 보고, 변경 없음, Codex 리뷰 실패(사용량 한도), 응답 없음(구현 75분 / 검증 120분).
 
+**Codex를 쓸 수 없을 때** (리뷰 status=`failed`, 예: 사용량 한도): `claude-review` 워크플로가 Claude **Opus**로 같은 커밋을 독립 검수합니다. 구현 세션과 분리된 새 세션이고 읽기 전용입니다. 판정 댓글은 `github-actions[bot]`이 쓴 것만 믿으며, 구현 job은 이 계정으로 댓글을 쓸 수 없습니다. head마다 한 번만 요청합니다.
+
 Codex 판정은 `chatgpt-codex-connector[bot]`(id 199175422, type Bot)가 쓴 마커만 믿고, 커밋 SHA가 현재 head와 같아야 합니다. 이전 커밋에 대한 PASS는 무시합니다.
 
 ## 구성
@@ -48,6 +50,7 @@ Codex 판정은 `chatgpt-codex-connector[bot]`(id 199175422, type Bot)가 쓴 �
 | --- | --- |
 | `.github/workflows/orchestrator.yml` | 이벤트(라벨, Codex 댓글, CI 완료, 20분 watchdog) → 상태 전이 |
 | `.github/workflows/claude-work.yml` | 오케스트레이터만 dispatch. Claude 실행 → 커밋·푸시 → PR/재검증 요청 |
+| `.github/workflows/claude-review.yml` | Codex 불가 시 Claude(Opus) 대체 검수 |
 | `.github/workflows/ci.yml` | `npm test` |
 | `scripts/orch/core.mjs` | 순수 로직 (계획 검증, 상태 마커, Codex/CI 판정, 프롬프트) |
 | `scripts/orch/main.mjs` | GitHub I/O와 상태 전이 |

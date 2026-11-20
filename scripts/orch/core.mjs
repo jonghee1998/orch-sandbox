@@ -237,7 +237,7 @@ export function decide(codex, ci, { requireCi = true } = {}) {
   // Codex can finish before CI has even registered its check runs: "none" means "not yet", not "no CI".
   if (ci.result === "none" && requireCi) return { action: "wait", reason: "CI 시작 대기" };
   const reasons = [];
-  if (codex.result === "fail") reasons.push("Codex 미해결 지적 있음");
+  if (codex.result === "fail") reasons.push(codex.source === "claude" ? "Claude 대체 검수 FAIL" : "Codex 미해결 지적 있음");
   if (ci.result === "failure") reasons.push(`CI 실패: ${ci.failed.map((f) => f.name).join(", ")}`);
   return reasons.length ? { action: "fail", reason: reasons.join(" / ") } : { action: "pass" };
 }
@@ -321,5 +321,98 @@ export function finalPrBody(n, plan, passed) {
     ...plan.steps.map((s) => `- Step ${s.id}. ${s.title} — #${passed[s.id]}`),
     "",
     `Run Issue: #${n} (머지 후 orchestrator가 완료 처리합니다)`,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------- Claude fallback review
+// Used only when Codex cannot review (status "failed", e.g. usage limit).
+// Trust: the verdict comment must be written by github-actions[bot] (the claude-review workflow's
+// GITHUB_TOKEN). The implementing Claude job has no token that can write issue comments.
+
+export const ACTIONS_BOT = Object.freeze({ login: "github-actions[bot]", id: 41898282, type: "Bot" });
+
+export function isTrustedActionsBot(user) {
+  return !!user && user.login === ACTIONS_BOT.login && Number(user.id) === ACTIONS_BOT.id && user.type === ACTIONS_BOT.type;
+}
+
+const CLAUDE_REVIEW_RE = /<!-- orch-claude-review:v1 ([\s\S]*?) -->/;
+const VERDICTS = new Set(["PASS", "FAIL", "ERROR"]);
+
+export function claudeReviewMarker(data) {
+  const json = JSON.stringify(data).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  return `<!-- orch-claude-review:v1 ${json} -->`;
+}
+
+export function parseClaudeReview(body) {
+  const m = CLAUDE_REVIEW_RE.exec(body ?? "");
+  if (!m) return null;
+  let j;
+  try { j = JSON.parse(m[1]); } catch { return null; }
+  if (!j || typeof j.commit_sha !== "string" || !/^[a-f0-9]{40}$/.test(j.commit_sha)) return null;
+  if (!VERDICTS.has(j.verdict)) return null;
+  return { sha: j.commit_sha, verdict: j.verdict, findings: Array.isArray(j.findings) ? j.findings : [], summary: String(j.summary ?? "") };
+}
+
+/** @returns {{result: "none"|"pass"|"fail"|"error", findings?: object[], summary?: string, url?: string, source: "claude"}} */
+export function claudeReviewVerdict(comments, headSha) {
+  let best = null;
+  for (const c of comments ?? []) {
+    if (!isTrustedActionsBot(c.user)) continue;
+    const r = parseClaudeReview(c.body);
+    if (!r || r.sha !== headSha) continue;
+    const at = c.updated_at ?? c.created_at ?? "";
+    if (!best || at > best.at) best = { ...r, at, url: c.html_url };
+  }
+  if (!best) return { result: "none", source: "claude" };
+  const result = best.verdict === "PASS" ? "pass" : best.verdict === "FAIL" ? "fail" : "error";
+  return { result, findings: best.findings, summary: best.summary, url: best.url, status: `claude:${best.verdict}`, source: "claude" };
+}
+
+/** Validate the reviewer's .orch/REVIEW.json. Returns null if malformed (treated as ERROR). */
+export function parseReviewFile(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return null; }
+  if (!j || !["PASS", "FAIL"].includes(j.verdict)) return null;
+  const findings = Array.isArray(j.findings) ? j.findings : [];
+  if (j.verdict === "FAIL" && findings.length === 0) return null; // a FAIL must say what to fix
+  const clean = findings.slice(0, 30).map((f) => ({
+    path: String(f?.path ?? "").slice(0, 200),
+    line: Number.isInteger(f?.line) ? f.line : null,
+    body: String(f?.body ?? "").slice(0, 2000),
+  })).filter((f) => f.body);
+  if (j.verdict === "FAIL" && clean.length === 0) return null;
+  return { verdict: j.verdict, summary: String(j.summary ?? "").slice(0, 3000), findings: clean };
+}
+
+export function reviewPrompt(plan, stepId, baseRef) {
+  const step = plan.steps.find((s) => s.id === stepId);
+  return [
+    "너는 이 저장소의 독립 검수자다. 구현자와 별개로, 현재 체크아웃된 커밋이 아래 스텝을 올바르게 구현했는지 검증한다.",
+    "코드는 수정하지 않는다. 판정 파일 하나만 작성한다.",
+    ...stepBlock(plan, step),
+    "## 검수 방법",
+    `- 변경 범위: \`git diff ${baseRef}...HEAD\` (필요하면 git log/show 사용)`,
+    "- `npm test`를 실행해 결과를 확인한다.",
+    "- 완료 기준을 하나씩 실제 코드와 테스트로 확인한다. 테스트가 기준을 실제로 검증하는지도 본다.",
+    "- 버그, 엣지 케이스 누락, 보안 문제, 스텝 범위 밖 변경을 찾는다. 스타일·취향만으로는 FAIL하지 않는다.",
+    "## 결과 (반드시 작성)",
+    "`.orch/REVIEW.json`에 아래 JSON만 쓴다:",
+    '{"verdict":"PASS"|"FAIL","summary":"판정 근거 2~4줄","findings":[{"path":"src/x.mjs","line":12,"body":"무엇이 왜 문제이고 기대 동작은 무엇인지"}]}',
+    "- FAIL이면 findings에 고쳐야 할 항목을 1개 이상 구체적으로 적는다. PASS면 findings는 빈 배열.",
+  ].join("\n\n");
+}
+
+export function claudeReviewComment({ sha, verdict, summary, findings, runUrl }) {
+  const head = verdict === "PASS" ? "✅ PASS" : verdict === "FAIL" ? "❌ FAIL" : "⚠️ ERROR";
+  const list = (findings ?? []).map((f, i) => `${i + 1}. \`${f.path}${f.line ? `:${f.line}` : ""}\` — ${f.body}`);
+  return [
+    claudeReviewMarker({ commit_sha: sha, verdict, summary, findings }),
+    `### Claude 대체 검수 (Opus, 독립 세션): ${head}`,
+    `커밋 \`${sha.slice(0, 7)}\` · Codex 리뷰를 사용할 수 없어 대신 수행했습니다.`,
+    "",
+    summary || "",
+    list.length ? `\n**지적 사항**\n${list.join("\n")}` : "",
+    "",
+    `[실행 로그](${runUrl})`,
   ].join("\n");
 }

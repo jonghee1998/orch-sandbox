@@ -1,0 +1,77 @@
+# Fallback independent review, dispatched by the orchestrator only when Codex cannot review.
+# Read-only for the code: the PR commit is checked out without credentials and nothing is pushed.
+# The verdict comment is written with this workflow's GITHUB_TOKEN (author github-actions[bot]);
+# the orchestrator trusts only that author, so the implementing job cannot forge a PASS.
+name: claude-review
+run-name: "claude-review #${{ inputs.issue }} pr ${{ inputs.pr }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue: { required: true, type: string }
+      pr: { required: true, type: string }
+      sha: { required: true, type: string }
+
+permissions: {}
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write          # post the verdict comment
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: PR commit under review
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Trusted orchestrator scripts (from main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: .orch-main
+          persist-credentials: false
+          sparse-checkout: scripts/orch
+      - name: Move trusted scripts out of the reviewed tree
+        run: cp -r .orch-main/scripts/orch "$RUNNER_TEMP/orch" && rm -rf .orch-main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prepare review prompt
+        id: prep
+        run: node "$RUNNER_TEMP/orch/main.mjs" review-prepare
+        env:
+          READ_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+          PR: ${{ inputs.pr }}
+          SHA: ${{ inputs.sha }}
+      - name: Install dependencies
+        if: steps.prep.outputs.skip != 'true'
+        run: if [ -f package-lock.json ]; then npm ci; fi
+      - name: Claude review (Opus)
+        id: claude
+        if: steps.prep.outputs.skip != 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_bots: "*"
+          prompt: ${{ steps.prep.outputs.prompt }}
+          claude_args: >-
+            --max-turns 40
+            --model opus
+            --allowedTools "Read,Glob,Grep,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(npm test:*),Bash(node:*),Bash(ls:*),Bash(mkdir:*)"
+      - name: Post verdict
+        if: always() && steps.prep.outputs.skip != 'true'
+        run: node "$RUNNER_TEMP/orch/main.mjs" review-publish
+        env:
+          READ_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          SHA: ${{ inputs.sha }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
