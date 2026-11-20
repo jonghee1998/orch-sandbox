@@ -7,3 +7,9 @@ const LABELS = new Map([
 export function roleLabel(role) {
   return typeof role === 'string' && LABELS.has(role) ? LABELS.get(role) : '알 수 없음';
 }
+
+const EDITABLE = new Set(['admin', 'editor']);
+
+export function canEdit(role) {
+  return typeof role === 'string' && EDITABLE.has(role);
+}
