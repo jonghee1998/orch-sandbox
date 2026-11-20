@@ -1,0 +1,26 @@
+# Temporary probe (do not merge): can the engine's Claude token read subscription usage?
+# Prints only HTTP status, top-level keys, utilization % and reset times. Never the token or headers.
+name: usage-probe
+on:
+  pull_request:
+    paths: [".github/workflows/usage-probe.yml"]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Claude /api/oauth/usage
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set +e
+          [ -n "$TOKEN" ] || { echo "no CLAUDE_CODE_OAUTH_TOKEN secret"; exit 1; }
+          code=$(curl -sS -o /tmp/u.json -w '%{http_code}' https://api.anthropic.com/api/oauth/usage \
+            -H "Authorization: Bearer $TOKEN" -H "anthropic-beta: oauth-2025-04-20" -H "content-type: application/json")
+          echo "HTTP $code"
+          jq -c 'keys' /tmp/u.json 2>/dev/null || echo "(non-JSON body, $(wc -c </tmp/u.json) bytes)"
+          jq -c 'to_entries | map(select(.value|type=="object")) | map({k:.key, pct:(.value.utilization // null), resets:(.value.resets_at // null)})' /tmp/u.json 2>/dev/null
+          jq -c '{error_type:(.error.type // .type // null), error_message:(.error.message // null)}' /tmp/u.json 2>/dev/null
+          rm -f /tmp/u.json
