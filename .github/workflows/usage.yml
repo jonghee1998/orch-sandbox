@@ -25,7 +25,8 @@ jobs:
     permissions:
       contents: read
       issues: write
-      actions: write   # prune old encrypted-login cache entries
+      pull-requests: read   # Codex review comments live on PRs
+      actions: write        # prune old encrypted-login cache entries
     steps:
       - uses: actions/checkout@v4
         with:

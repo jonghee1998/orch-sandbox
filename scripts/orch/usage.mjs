@@ -104,9 +104,13 @@ async function publish(file) {
 
   // Codex comments live on PRs. The repo-wide comment listing proved incomplete with the workflow token,
   // so read the 15 most recently updated PRs directly.
-  const prs = (await gh.get("/pulls?state=all&sort=updated&direction=desc&per_page=15")) ?? [];
   const comments = [];
-  for (const pr of prs) comments.push(...((await gh.get(`/issues/${pr.number}/comments?per_page=100`)) ?? []));
+  try {
+    const prs = (await gh.get("/pulls?state=all&sort=updated&direction=desc&per_page=15")) ?? [];
+    for (const pr of prs) comments.push(...((await gh.get(`/issues/${pr.number}/comments?per_page=100`)) ?? []));
+  } catch (e) {
+    console.log(`[usage] codex review history unavailable: ${e.status ?? e.message}`); // quota read still counts
+  }
   const activity = codexFromComments(comments, now.getTime());
   let read = null;
   try { if (env.CODEX_LIMITS_FILE && fs.existsSync(env.CODEX_LIMITS_FILE)) read = JSON.parse(fs.readFileSync(env.CODEX_LIMITS_FILE, "utf8")); } catch { read = null; }
