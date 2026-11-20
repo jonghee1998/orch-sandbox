@@ -316,7 +316,8 @@ async function openFinal(run) {
     const prObj = prNum ? await gh().get(`/pulls/${prNum}`, { allow404: true }) : null;
     const { summary, unmet } = C.extractSummary(prObj?.body);
     const info = st.stepInfo?.[s.id] ?? {};
-    steps.push({ id: s.id, title: s.title, pr: prNum, summary, unmet, reviewer: REVIEWER_SHORT[info.reviewer] ?? "-", retries: info.retries ?? 0 });
+    const usedModel = C.pickModel(plan, s.id, info.retries ?? 0).model;
+    steps.push({ id: s.id, title: s.title, pr: prNum, summary, unmet, model: usedModel, reviewer: REVIEWER_SHORT[info.reviewer] ?? "-", retries: info.retries ?? 0 });
   }
 
   const final = await gh().post("/pulls", {
@@ -551,7 +552,9 @@ async function prepare() {
   setOutput("skip", "false");
   setOutput("branch", branch);
   setOutput("start_sha", git("rev-parse", "HEAD"));
-  setOutput("model_args", run.plan.model ? `--model ${run.plan.model}` : "");
+  const pick = C.pickModel(run.plan, step, mode === "implement" ? 0 : st.retries ?? 0);
+  log(`model: ${pick.model} (${pick.why})`);
+  setOutput("model_args", `--model ${pick.model}`);
   setOutput("prompt", prompt);
 }
 
