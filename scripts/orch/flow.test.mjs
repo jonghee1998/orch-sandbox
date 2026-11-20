@@ -11,7 +11,7 @@ const CODEX = { login: C.CODEX_BOT.login, id: C.CODEX_BOT.id, type: "Bot" };
 const sha = (c) => c.repeat(40);
 
 function fakeGitHub() {
-  const db = { seq: 0, issues: {}, comments: {}, labels: new Set(), refs: { main: sha("0") }, dispatches: [], checks: {}, notifications: [], merges: [], reviews: [] };
+  const db = { seq: 0, issues: {}, comments: {}, labels: new Set(), refs: { main: sha("0") }, dispatches: [], checks: {}, notifications: [], merges: [], reviews: [], compareFiles: ["src/text.mjs", "test/text.test.mjs"], pkg: {} };
   let clock = Date.parse("2026-11-20T00:00:00Z");
   const ts = () => new Date((clock += 1000)).toISOString();
   const json = (status, body) => new Response(body === undefined ? null : JSON.stringify(body), {
@@ -95,6 +95,11 @@ function fakeGitHub() {
       return json(200, { merged: true });
     }
     if (/^\/pulls\/\d+\/(comments|reviews)$/.test(p)) return paged([]);
+    if (p.startsWith("/compare/")) return json(200, { files: db.compareFiles.map((filename) => ({ filename })) });
+    if (p === "/contents/package.json") {
+      const pkg = db.pkg[u.searchParams.get("ref")];
+      return pkg ? json(200, { content: Buffer.from(JSON.stringify(pkg)).toString("base64") }) : json(404, {});
+    }
     if ((m = /^\/commits\/([a-f0-9]+)\/check-runs$/.exec(p))) return json(200, { check_runs: page > 1 ? [] : db.checks[m[1]] ?? [] });
     if (p === "/actions/workflows/claude-work.yml/dispatches") { db.dispatches.push(body.inputs); return json(204); }
     if (p === "/actions/workflows/claude-review.yml/dispatches") { db.reviews.push(body.inputs); return json(204); }
@@ -139,6 +144,9 @@ const codexSays = (pr, headSha, status, unresolved) => {
   const c = db.addComment(pr, body, CODEX);
   return fire("issue_comment", { action: "created", issue: { number: pr, pull_request: {} }, comment: c });
 };
+const ciDone = (prNum) => fire("workflow_run", {
+  workflow: { name: "ci" }, workflow_run: { name: "ci", conclusion: "success", pull_requests: [{ number: prNum }] },
+});
 const ciPass = (s) => { db.checks[s] = [{ name: "test", status: "completed", conclusion: "success", html_url: "u" }]; };
 const ciFail = (s) => { db.checks[s] = [{ name: "test", status: "completed", conclusion: "failure", html_url: "u" }]; };
 
@@ -200,19 +208,84 @@ test("happy path with one fix round: start -> PR -> FAIL -> fix -> PASS -> next 
   ciPass(sha("c"));
   await codexSays(pr2, sha("c"), "completed", false);
   const st = state(n);
-  assert.equal(st.status, "awaiting_merge");
+  assert.equal(st.status, "finalizing", "low risk -> auto merge path");
   const final = db.issues[st.finalPr];
   assert.equal(final.base.ref, "main");
   assert.equal(final.head.ref, C.runBranch(n));
-  assert.match(db.notifications.at(-1).title, /완료/);
+  assert.match(final.body, /완공 보고서/);
+  assert.match(final.body, /위험 낮음/);
+  assert.match(final.body, /\| 1\. 스텝1 \| Codex \| 1회 \|/, "step 1 needed one fix");
   assert.match(db.issues[n].body, /- \[x\] Step 2\. 스텝2 — 통과/);
 
-  // Owner merges the final PR -> watchdog closes the run
-  final.merged_at = "2026-11-21T00:00:00Z"; final.state = "closed";
-  await fire("schedule", {});
+  // CI still running on the final PR -> wait
+  db.checks[final.head.sha] = [{ name: "test", status: "in_progress", conclusion: null, html_url: "u" }];
+  await ciDone(final.number);
+  assert.equal(state(n).status, "finalizing");
+  ciPass(final.head.sha);
+  await ciDone(final.number);
+  assert.ok(final.merged_at, "final PR auto-merged");
+  assert.equal(db.merges.at(-1).merge_method, "merge");
   assert.equal(state(n).status, "done");
   assert.equal(db.issues[n].state, "closed");
   assert.deepEqual(labels(n), ["orch:done"]);
+  assert.match(db.notifications.at(-1).title, /자동 머지/);
+});
+
+test("high risk (new dependency + auth file) -> awaiting owner with report; owner merge -> done", async () => {
+  db.compareFiles = ["src/auth/login.mjs", "package.json", "package-lock.json"];
+  db.pkg = { main: { dependencies: {} }, [C.runBranch(db.seq + 1)]: { dependencies: { bcrypt: "^6.0.0" } } };
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("4");
+  await publish(n, "implement", 1);
+  const pr = state(n).pr;
+  ciPass(sha("4"));
+  await codexSays(pr, sha("4"), "completed", false);
+  const st = state(n);
+  assert.equal(st.status, "awaiting_merge");
+  const final = db.issues[st.finalPr];
+  assert.match(final.body, /확인 필요/);
+  assert.match(final.body, /로그인·결제·권한 관련 코드\*\*: src\/auth\/login\.mjs/);
+  assert.match(final.body, /외부 패키지 추가·변경\*\*: 추가 bcrypt@\^6\.0\.0/);
+  assert.match(db.notifications.at(-1).title, /승인 필요/);
+  assert.equal(final.merged_at, undefined, "never auto-merged");
+
+  final.merged_at = "2026-11-21T01:00:00Z"; final.state = "closed";
+  await fire("schedule", {});
+  assert.equal(state(n).status, "done");
+  db.compareFiles = ["src/text.mjs", "test/text.test.mjs"];
+  db.pkg = {};
+});
+
+test("auto_merge: false keeps a low-risk run for the owner", async () => {
+  const issue = db.newIssue(plan(1, { auto_merge: false }));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("3");
+  await publish(n, "implement", 1);
+  ciPass(sha("3"));
+  await codexSays(state(n).pr, sha("3"), "completed", false);
+  assert.equal(state(n).status, "awaiting_merge");
+  assert.match(db.issues[state(n).finalPr].body, /auto_merge: false/);
+});
+
+test("final PR CI failure -> blocked as final; resume switches to manual merge", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("2");
+  await publish(n, "implement", 1);
+  ciPass(sha("2"));
+  await codexSays(state(n).pr, sha("2"), "completed", false);
+  const final = db.issues[state(n).finalPr];
+  db.checks[final.head.sha] = [{ name: "test", status: "completed", conclusion: "failure", html_url: "u" }];
+  await ciDone(final.number);
+  assert.equal(state(n).status, "blocked");
+  assert.equal(state(n).blockKind, "final");
+  assert.equal(final.merged_at, undefined);
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: db.issues[n] });
+  assert.equal(state(n).status, "awaiting_merge");
 });
 
 test("retry limit -> blocked with notification; resume restarts the step on a new attempt", async () => {
@@ -277,7 +350,8 @@ test("Codex failed (usage limit) -> Claude fallback review once -> FAIL -> fix -
   await codexSays(pr, sha("7"), "failed", true);
   assert.equal(db.reviews.at(-1).sha, sha("7"), "new head gets its own fallback review");
   await claudeReviewSays(pr, sha("7"), "PASS");
-  assert.equal(state(n).status, "awaiting_merge");
+  assert.equal(state(n).status, "finalizing");
+  assert.match(db.issues[state(n).finalPr].body, /Claude Opus \(대체\) \| 1회/);
 });
 
 test("fallback review ERROR -> blocked as review; resume re-requests Codex", async () => {

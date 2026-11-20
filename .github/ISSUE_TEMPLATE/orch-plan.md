@@ -12,6 +12,8 @@ labels: []
   "goal": "한 줄 목표",
   "context": "기술 스택, 제약 등 (선택)",
   "max_retries": 2,
+  "auto_merge": true,
+  "try": "완성 후 사람이 직접 확인해 볼 방법 (선택)",
   "steps": [
     {
       "id": 1,

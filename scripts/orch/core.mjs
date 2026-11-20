@@ -65,6 +65,8 @@ export function validatePlan(p) {
   if (p.model !== undefined && !(typeof p.model === "string" && /^[a-z0-9][a-z0-9.\-]{0,63}$/.test(p.model))) {
     return err("model 형식이 올바르지 않습니다.");
   }
+  if (p.auto_merge !== undefined && typeof p.auto_merge !== "boolean") return err("auto_merge는 true/false입니다.");
+  if (p.try !== undefined && !(typeof p.try === "string" && p.try.length <= 2000)) return err("try는 2000자 이내 문자열입니다.");
   return {
     ok: true,
     plan: {
@@ -72,6 +74,8 @@ export function validatePlan(p) {
       context: isStr(p.context) ? p.context.trim() : "",
       model: p.model ?? null,
       max_retries: maxRetries,
+      auto_merge: p.auto_merge ?? true,
+      try: isStr(p.try) ? p.try.trim() : "",
       steps: p.steps.map((s) => ({
         id: s.id,
         title: s.title.trim(),
@@ -124,7 +128,8 @@ const STATUS_TEXT = {
   reviewing: "🔍 검증 중 (Codex + CI)",
   fixing: "🛠️ 수정 중 (Claude)",
   blocked: "⛔ 중단 — 판단 필요",
-  awaiting_merge: "✅ 전체 완료 — 최종 머지 승인 대기",
+  finalizing: "🟢 전체 통과 — 최종 CI 확인 후 자동 머지",
+  awaiting_merge: "🟡 전체 통과 — 머지 승인 대기 (완공 보고서 확인)",
   done: "🏁 완료",
   cancelled: "🚫 취소됨",
 };
@@ -141,7 +146,7 @@ export function renderBoard(plan, state, now = new Date()) {
   const passed = st.passed ?? {};
   const lines = plan.steps.map((s) => {
     if (passed[s.id]) return `- [x] Step ${s.id}. ${s.title} — 통과 (#${passed[s.id]})`;
-    if (st.step === s.id && !["awaiting_merge", "done", "cancelled"].includes(st.status)) {
+    if (st.step === s.id && !["finalizing", "awaiting_merge", "done", "cancelled"].includes(st.status)) {
       return `- [ ] **Step ${s.id}. ${s.title} — ${STATUS_TEXT[st.status] ?? st.status}**`;
     }
     return `- [ ] Step ${s.id}. ${s.title}`;
@@ -311,16 +316,115 @@ export function prBody(n, plan, stepId, summary) {
   ].join("\n");
 }
 
-export function finalPrBody(n, plan, passed) {
+// ---------------------------------------------------------------- final report + risk gate
+
+export const finalMarker = (n) => `<!-- orch-final:${n} -->`;
+export function parseFinalMarker(body) {
+  const m = /<!-- orch-final:(\d+) -->/.exec(body ?? "");
+  return m ? Number(m[1]) : null;
+}
+
+// Changes a non-developer owner should look at before they reach main.
+export const RISK_RULES = [
+  { re: /(^|\/)(migrations?|prisma)\/|\.sql$|(^|\/)schema\.(prisma|sql|[mc]?[jt]s)$/i, reason: "DB 구조 변경" },
+  { re: /(auth|login|logout|session|password|passwd|token|oauth|payment|billing|checkout|permission|rbac|acl|middleware)/i, reason: "로그인·결제·권한 관련 코드" },
+  { re: /^\.github\//, reason: "GitHub Actions·저장소 설정 변경" },
+  { re: /^scripts\/orch\//, reason: "오케스트레이터 자체 변경" },
+  { re: /(^|\/)(vercel\.json|netlify\.toml|Dockerfile|docker-compose\.ya?ml|fly\.toml|wrangler\.toml|next\.config\.[mc]?[jt]s)$/i, reason: "배포·빌드 설정 변경" },
+  { re: /(^|\/)\.env/i, reason: "환경변수 파일" },
+  { re: /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|poetry\.lock|go\.sum|Cargo\.lock)$/i, reason: "의존성 잠금 파일 변경" },
+];
+export const MAX_LOW_RISK_FILES = 40;
+
+const DEP_FIELDS = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
+
+/** Dependency changes between two package.json objects (null = file missing). */
+export function depDiff(oldPkg, newPkg) {
+  const out = [];
+  for (const field of DEP_FIELDS) {
+    const a = oldPkg?.[field] ?? {}, b = newPkg?.[field] ?? {};
+    for (const [k, v] of Object.entries(b)) {
+      if (!(k in a)) out.push(`추가 ${k}@${v}`);
+      else if (a[k] !== v) out.push(`변경 ${k} ${a[k]} → ${v}`);
+    }
+    for (const k of Object.keys(a)) if (!(k in b)) out.push(`제거 ${k}`);
+  }
+  return out;
+}
+
+/** @param files [{filename}] from the compare API */
+export function classifyRisk(files, deps = []) {
+  const byReason = new Map();
+  for (const f of files ?? []) {
+    for (const r of RISK_RULES) {
+      if (r.re.test(f.filename)) {
+        if (!byReason.has(r.reason)) byReason.set(r.reason, []);
+        byReason.get(r.reason).push(f.filename);
+      }
+    }
+  }
+  const reasons = [...byReason].map(([reason, list]) => ({ reason, detail: list.slice(0, 8).join(", ") + (list.length > 8 ? ` 외 ${list.length - 8}개` : "") }));
+  if (deps.length) reasons.push({ reason: "외부 패키지 추가·변경", detail: deps.slice(0, 8).join(", ") });
+  if ((files ?? []).length > MAX_LOW_RISK_FILES) reasons.push({ reason: "변경 파일이 많음", detail: `${files.length}개` });
+  return { level: reasons.length ? "high" : "low", reasons };
+}
+
+/** Pull the "## 변경 요약" section and any ❌ lines out of a step PR body. */
+export function extractSummary(prBodyText) {
+  const body = String(prBodyText ?? "").split(/\n---\n/)[0];
+  const sec = /##\s*변경 요약\s*\n([\s\S]*?)(?=\n##\s|$)/.exec(body);
+  const summary = (sec ? sec[1] : "").trim().split("\n").filter(Boolean).slice(0, 6).join("\n");
+  const unmet = body.split("\n").filter((l) => l.includes("❌")).map((l) => l.replace(/^\s*[-*]\s*/, "").trim()).slice(0, 5);
+  return { summary, unmet };
+}
+
+/**
+ * Completion report written for a non-developer: what was built, how to try it,
+ * how it was checked, what to watch out for, what was not verified.
+ * @param steps [{id, title, pr, summary, unmet, reviewer, retries}]
+ */
+export function finalReport({ n, plan, steps, risk, autoMerge }) {
+  const verdict = autoMerge
+    ? "🟢 **위험 낮음 → 최종 CI 통과 시 자동 머지됩니다.** 확인할 필요는 없지만, 아래 '확인 방법'으로 써볼 수 있습니다."
+    : risk.level === "high"
+      ? "🟡 **확인 필요 → 아래 '주의할 점'을 보고 머지 여부를 결정해 주세요.**"
+      : "🟡 **계획에서 자동 머지를 꺼 두었습니다 (`auto_merge: false`). 확인 후 머지해 주세요.**";
+  const built = steps.map((s) => `**${s.id}. ${s.title}** (#${s.pr})\n${s.summary ? s.summary.split("\n").map((l) => (l.startsWith("-") ? l : `- ${l}`)).join("\n") : "- (요약 없음)"}`);
+  const howTo = plan.try
+    ? plan.try
+    : plan.steps.flatMap((s) => s.done_when).map((x) => `- ${x}`).join("\n");
+  const checks = steps.map((s) => `| ${s.id}. ${s.title} | ${s.reviewer} | ${s.retries}회 | #${s.pr} |`);
+  const cautions = risk.reasons.length
+    ? risk.reasons.map((r) => `- **${r.reason}**: ${r.detail}`).join("\n")
+    : "- 없음 (DB·로그인·결제·권한·배포 설정·외부 패키지 변경 없음)";
+  const unmet = steps.flatMap((s) => s.unmet.map((u) => `- Step ${s.id}: ${u}`));
   return [
-    `<!-- orch-final:${n} -->`,
-    `## ${plan.goal}`,
+    finalMarker(n),
+    `## 완공 보고서 — ${plan.goal}`,
     "",
-    `Run #${n}의 모든 스텝이 Codex 검증과 CI를 통과했습니다. **머지는 사용자 승인으로만 진행합니다.**`,
+    verdict,
     "",
-    ...plan.steps.map((s) => `- Step ${s.id}. ${s.title} — #${passed[s.id]}`),
+    "### 만든 것",
+    built.join("\n\n"),
     "",
-    `Run Issue: #${n} (머지 후 orchestrator가 완료 처리합니다)`,
+    "### 확인 방법",
+    howTo,
+    "",
+    "### 검사 결과",
+    "| 스텝 | 검사 | 수정 | PR |",
+    "| --- | --- | --- | --- |",
+    ...checks,
+    "",
+    "모든 스텝이 독립 검사와 CI(`npm test`)를 통과했습니다.",
+    "",
+    "### 주의할 점",
+    cautions,
+    "",
+    "### 확인하지 못한 것",
+    ...(unmet.length ? unmet : []),
+    "- 실제 배포 환경에서는 실행해 보지 않았습니다 (CI 테스트까지만 확인).",
+    "",
+    `Run Issue: #${n}`,
   ].join("\n");
 }
 

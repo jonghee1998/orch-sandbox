@@ -136,7 +136,7 @@ async function start(run, sender) {
     return;
   }
   const st = run.state;
-  if (st && ["implementing", "reviewing", "fixing"].includes(st.status)) {
+  if (st && ["implementing", "reviewing", "fixing", "finalizing"].includes(st.status)) {
     await comment(run.n, `ℹ️ 이미 진행 중입니다 (${st.status}, Step ${st.step}).`);
     return;
   }
@@ -146,6 +146,12 @@ async function start(run, sender) {
   }
 
   // Resume from blocked
+  if (st?.status === "blocked" && st.blockKind === "final") {
+    await save(run, { status: "awaiting_merge", reason: null },
+      `▶️ 자동 머지를 멈추고 수동 머지 대기로 바꿨습니다. 최종 PR #${st.finalPr}을 확인해 주세요.`);
+    await setLabels(run.n, [C.LABELS.run], [C.LABELS.blocked]);
+    return;
+  }
   if (st?.status === "blocked") {
     const pr = st.pr ? await gh().get(`/pulls/${st.pr}`, { allow404: true }) : null;
     if (st.blockKind === "review" && pr?.state === "open") {
@@ -199,7 +205,10 @@ async function evaluatePR(prNumber, { reviewRunFailed = false } = {}) {
   const pr = await gh().get(`/pulls/${prNumber}`, { allow404: true });
   if (!pr || pr.state !== "open" || pr.user.login !== OWNER) return;
   const link = C.parsePrMarker(pr.body);
-  if (!link) return;
+  if (!link) {
+    const finalOf = C.parseFinalMarker(pr.body);
+    return finalOf ? evaluateFinal(pr, finalOf) : undefined;
+  }
   const run = await loadRun(link.issue);
   const st = run?.state;
   if (!run?.plan || !st || st.status !== "reviewing" || st.pr !== pr.number || st.step !== link.step) {
@@ -238,11 +247,15 @@ async function evaluatePR(prNumber, { reviewRunFailed = false } = {}) {
 
   if (d.action === "wait") return { run, pr, codex, fallback: review !== codex };
   if (d.action === "block") return block(run, d.reason, codex.url ?? pr.html_url, "review");
-  if (d.action === "pass") return onPass(run, pr, review.source === "claude" ? "Claude(Opus) 대체 검수 PASS" : "Codex 지적 없음");
+  if (d.action === "pass") return onPass(run, pr, review.source === "claude" ? "claude" : "codex");
   return onFail(run, pr, d.reason);
 }
 
-async function onPass(run, pr, reviewNote = "Codex 지적 없음") {
+const REVIEWER_TEXT = { codex: "Codex 지적 없음", claude: "Claude(Opus) 대체 검수 PASS" };
+const REVIEWER_SHORT = { codex: "Codex", claude: "Claude Opus (대체)" };
+
+async function onPass(run, pr, reviewer = "codex") {
+  const reviewNote = REVIEWER_TEXT[reviewer];
   const st = run.state;
   const step = run.plan.steps.find((s) => s.id === st.step);
   try {
@@ -255,24 +268,97 @@ async function onPass(run, pr, reviewNote = "Codex 지적 없음") {
     return block(run, `스텝 PR 머지 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "work");
   }
   const passed = { ...(st.passed ?? {}), [step.id]: pr.number };
+  const stepInfo = { ...(st.stepInfo ?? {}), [step.id]: { reviewer, retries: st.retries ?? 0 } };
   const total = run.plan.steps.length;
 
   if (step.id < total) {
-    await save(run, { status: "implementing", step: step.id + 1, attempt: 1, retries: 0, pr: null, passed, requestedAt: now() },
+    await save(run, { status: "implementing", step: step.id + 1, attempt: 1, retries: 0, pr: null, passed, stepInfo, requestedAt: now() },
       `✅ Step ${step.id} 통과 (#${pr.number}, ${reviewNote} + CI 통과) → Step ${step.id + 1} 구현 시작`);
     await dispatchWork(run, "implement");
     return;
   }
 
+  run.state = { ...st, passed, stepInfo };
+  return openFinal(run);
+}
+
+async function readPackageJson(ref) {
+  const f = await gh().get(`/contents/package.json?ref=${encodeURIComponent(ref)}`, { allow404: true });
+  if (!f?.content) return null;
+  try {
+    return JSON.parse(Buffer.from(f.content, "base64").toString("utf8"));
+  } catch {
+    return { __unparseable: true };
+  }
+}
+
+async function openFinal(run) {
+  const st = run.state;
+  const plan = run.plan;
+  const branch = C.runBranch(run.n);
+  const cmp = await gh().get(`/compare/main...${encodeURIComponent(branch)}`);
+  const files = cmp.files ?? [];
+  const deps = files.some((f) => f.filename === "package.json")
+    ? C.depDiff(await readPackageJson("main"), await readPackageJson(branch))
+    : [];
+  const risk = C.classifyRisk(files, deps);
+  const autoMerge = plan.auto_merge !== false && risk.level === "low";
+
+  const steps = [];
+  for (const s of plan.steps) {
+    const prNum = st.passed?.[s.id];
+    const prObj = prNum ? await gh().get(`/pulls/${prNum}`, { allow404: true }) : null;
+    const { summary, unmet } = C.extractSummary(prObj?.body);
+    const info = st.stepInfo?.[s.id] ?? {};
+    steps.push({ id: s.id, title: s.title, pr: prNum, summary, unmet, reviewer: REVIEWER_SHORT[info.reviewer] ?? "-", retries: info.retries ?? 0 });
+  }
+
   const final = await gh().post("/pulls", {
-    title: `[orch] ${run.plan.goal}`,
-    head: C.runBranch(run.n),
+    title: `[orch] ${plan.goal}`,
+    head: branch,
     base: "main",
-    body: C.finalPrBody(run.n, run.plan, passed),
+    body: C.finalReport({ n: run.n, plan, steps, risk, autoMerge }),
   });
-  await save(run, { status: "awaiting_merge", pr: null, passed, finalPr: final.number },
-    `🎉 전체 ${total}개 스텝 통과. 최종 PR #${final.number}을 열었습니다. **머지는 직접 승인해 주세요.**`);
-  await notify(`✅ Run #${run.n} 완료`, `${run.plan.goal} — 최종 PR #${final.number} 머지 승인 필요`, final.html_url);
+
+  if (autoMerge) {
+    await save(run, { status: "finalizing", pr: null, finalPr: final.number, risk: risk.level },
+      `🎉 전체 ${plan.steps.length}개 스텝 통과. 위험 낮음 → 최종 PR #${final.number}의 CI가 통과하면 자동 머지합니다.`);
+    return;
+  }
+  const why = risk.reasons.length ? risk.reasons.map((r) => r.reason).join(", ") : "auto_merge: false";
+  await save(run, { status: "awaiting_merge", pr: null, finalPr: final.number, risk: risk.level },
+    `🟡 전체 ${plan.steps.length}개 스텝 통과. **확인 필요** (${why}) → 최종 PR #${final.number}의 완공 보고서를 보고 머지해 주세요.`);
+  await notify(`🟡 Run #${run.n} 승인 필요`, `${plan.goal} — ${why}. 최종 PR #${final.number}`, final.html_url);
+}
+
+/** Final PR (run branch -> main) of a low-risk run: merge once its CI passes. */
+async function evaluateFinal(pr, n) {
+  const run = await loadRun(n);
+  const st = run?.state;
+  if (!st || st.status !== "finalizing" || st.finalPr !== pr.number) return;
+  const ci = C.ciVerdict(await ro().all(`/commits/${pr.head.sha}/check-runs`), SELF_CHECKS);
+  log(`final PR #${pr.number}: ci=${ci.result} mergeable=${pr.mergeable}`);
+  if (ci.result === "pending" || ci.result === "none") return;
+  if (ci.result === "failure") {
+    return block(run, `최종 PR CI 실패: ${ci.failed.map((f) => f.name).join(", ")} (main과 합쳤을 때 문제)`, pr.html_url, "final");
+  }
+  try {
+    await gh().put(`/pulls/${pr.number}/merge`, {
+      merge_method: "merge",
+      sha: pr.head.sha,
+      commit_title: `[orch] ${run.plan.goal} (#${pr.number})`,
+    });
+  } catch (e) {
+    return block(run, `최종 PR 자동 머지 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "final");
+  }
+  await finishRun(run, `🏁 최종 PR #${pr.number}을 자동 머지했습니다 (위험 낮음, CI 통과). 완료!`);
+  await notify(`✅ Run #${run.n} 완료 (자동 머지)`, `${run.plan.goal}`, pr.html_url);
+}
+
+async function finishRun(run, line) {
+  await save(run, { status: "done" }, line);
+  await setLabels(run.n, [C.LABELS.done], [C.LABELS.run]);
+  if (run.issue.state === "open") await gh().patch(`/issues/${run.n}`, { state: "closed", state_reason: "completed" });
 }
 
 async function onFail(run, pr, reason) {
@@ -329,12 +415,15 @@ async function watchOne(n) {
     return;
   }
 
-  if (st.status === "awaiting_merge" && st.finalPr) {
+  if (st.status === "finalizing" && st.finalPr) {
+    const pr = await gh().get(`/pulls/${st.finalPr}`, { allow404: true });
+    if (pr?.state === "open") return evaluateFinal(pr, n);
+  }
+
+  if (["awaiting_merge", "finalizing"].includes(st.status) && st.finalPr) {
     const pr = await gh().get(`/pulls/${st.finalPr}`, { allow404: true });
     if (pr?.merged_at) {
-      await save(run, { status: "done" }, `🏁 최종 PR #${pr.number}이 머지되어 완료 처리했습니다.`);
-      await setLabels(n, [C.LABELS.done], [C.LABELS.run]);
-      if (run.issue.state === "open") await gh().patch(`/issues/${n}`, { state: "closed", state_reason: "completed" });
+      await finishRun(run, `🏁 최종 PR #${pr.number}이 머지되어 완료 처리했습니다.`);
     } else if (pr?.state === "closed") {
       await save(run, { status: "cancelled", reason: "최종 PR이 머지 없이 닫힘" }, "🚫 최종 PR이 머지 없이 닫혀 run을 종료했습니다.");
       await setLabels(n, [], [C.LABELS.run]);
@@ -355,7 +444,7 @@ async function onEvent() {
     if (ev.action === "labeled" && ev.label?.name === C.LABELS.go) return start(run, ev.sender?.login);
     if (ev.action === "labeled" && ev.label?.name === C.LABELS.cancel) return cancel(run, ev.sender?.login, "orch:cancel 라벨");
     if (ev.action === "closed") {
-      if (run.state?.status === "awaiting_merge") return watchOne(run.n); // closed by the final merge -> done
+      if (["awaiting_merge", "finalizing"].includes(run.state?.status)) return watchOne(run.n);
       return cancel(run, ev.sender?.login, "Issue가 닫힘");
     }
     return;

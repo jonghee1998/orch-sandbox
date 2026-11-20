@@ -156,3 +156,34 @@ test("Claude fallback review: trust, exact SHA, file validation", () => {
   assert.equal(C.parseReviewFile('{"verdict":"FAIL","findings":[{"path":"a","line":2,"body":"b"}]}').findings[0].line, 2);
   assert.match(C.reviewPrompt(C.parsePlan(issueBody).plan, 1, "origin/orch/run-1"), /git diff origin\/orch\/run-1\.\.\.HEAD/);
 });
+
+test("risk gate: dependencies, sensitive paths, file count", () => {
+  assert.deepEqual(C.depDiff({ dependencies: { a: "1" } }, { dependencies: { a: "2", b: "1" }, devDependencies: { c: "1" } }),
+    ["변경 a 1 → 2", "추가 b@1", "추가 c@1"]);
+  assert.deepEqual(C.depDiff({ dependencies: { a: "1" } }, {}), ["제거 a"]);
+  const f = (...names) => names.map((filename) => ({ filename }));
+  assert.equal(C.classifyRisk(f("src/text.mjs", "test/text.test.mjs", "README.md")).level, "low");
+  for (const risky of ["db/migrations/001.sql", "prisma/schema.prisma", "src/app/api/login/route.ts", "src/payment.mjs",
+    ".github/workflows/x.yml", "vercel.json", ".env.example", "package-lock.json", "scripts/orch/main.mjs"]) {
+    assert.equal(C.classifyRisk(f(risky)).level, "high", risky);
+  }
+  assert.equal(C.classifyRisk(f("src/a.mjs"), ["추가 x@1"]).level, "high");
+  assert.equal(C.classifyRisk(f(...Array.from({ length: 41 }, (_, i) => `src/f${i}.mjs`))).reasons[0].reason, "변경 파일이 많음");
+});
+
+test("extractSummary + finalReport + plan options", () => {
+  const body = "<!-- orch-run:1:1 -->\nRun\n\n## 변경 요약\n- a 추가\n- b 수정\n\n## 완료 기준 확인\n- ✅ x\n- ❌ 이메일 발송은 확인 못 함\n\n---\n완료 기준:\n- ❌ not this";
+  const ex = C.extractSummary(body);
+  assert.equal(ex.summary, "- a 추가\n- b 수정");
+  assert.deepEqual(ex.unmet, ["❌ 이메일 발송은 확인 못 함"]);
+  const plan = C.parsePlan(issueBody).plan;
+  assert.equal(plan.auto_merge, true);
+  assert.equal(C.validatePlan({ ...planJson, auto_merge: "yes" }).ok, false);
+  const rep = C.finalReport({ n: 9, plan, autoMerge: false, risk: { level: "high", reasons: [{ reason: "DB 구조 변경", detail: "x.sql" }] },
+    steps: [{ id: 1, title: "문자 수", pr: 3, ...ex, reviewer: "Codex", retries: 0 }, { id: 2, title: "문장 수", pr: 4, summary: "", unmet: [], reviewer: "Codex", retries: 1 }] });
+  assert.equal(C.parseFinalMarker(rep), 9);
+  assert.match(rep, /확인 필요/);
+  assert.match(rep, /\*\*DB 구조 변경\*\*: x\.sql/);
+  assert.match(rep, /Step 1: ❌ 이메일 발송은 확인 못 함/);
+  assert.match(rep, /npm test 통과/, "done_when used as how-to when plan.try is empty");
+});
