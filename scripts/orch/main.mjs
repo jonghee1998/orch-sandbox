@@ -256,7 +256,8 @@ async function evaluatePR(prNumber, { reviewRunFailed = false } = {}) {
     await holdWork(run, "review", "검수할 수 있는 AI가 없음 (Codex OFF 또는 사용 불가 + Opus OFF)");
     return { run, pr, codex, fallback: true, held: true };
   }
-  if (st.held?.mode === "review" && route === "codex") await releaseHold(run);
+  // Release a review hold once a reviewer is available and nothing new needs dispatching.
+  if (st.held?.mode === "review" && (route === "codex" || st.claudeReviewFor === pr.head.sha)) await releaseHold(run);
   let review = codex;
   if (route === "claude") {
     const why = sw.codex ? `Codex 리뷰를 쓸 수 없어(status=${codex.status})` : "Codex가 OFF라";
