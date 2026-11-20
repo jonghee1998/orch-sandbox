@@ -100,7 +100,8 @@ function fakeGitHub() {
     if (/^\/pulls\/\d+\/(comments|reviews)$/.test(p)) return paged([]);
     if (p.startsWith("/compare/")) {
       const head = decodeURIComponent(p.split("...")[1] ?? "");
-      return json(200, { ahead_by: db.refs[head] ? 1 : 0, files: db.compareFiles.map((filename) => ({ filename })) });
+      return json(200, { ahead_by: db.refs[head] ? 1 : 0, files: db.compareFiles.map((filename) => ({ filename })),
+        commits: db.refs[head] ? [{ commit: { message: "Run #1 step 1: implement\n\n## 변경 요약\n- 복구된 요약" } }] : [] });
     }
     if (p === "/pulls" && method === "GET") {
       const head = (u.searchParams.get("head") ?? "").split(":")[1];
@@ -410,6 +411,7 @@ test("lost publish: pushed branch is recovered into a PR; nothing pushed -> bloc
   const pr = db.issues[state(i1.number).pr];
   assert.equal(pr.head.ref, C.stepBranch(i1.number, 1));
   assert.match(db.comments[i1.number].at(-1).body, /복구/);
+  assert.match(pr.body, /복구된 요약/, "summary rebuilt from the commit message");
   await lost(i1.number);                       // repeated event: state is no longer implementing -> no duplicate PR
   assert.equal(Object.values(db.issues).filter((x) => x.pull_request && x.head?.ref === pr.head.ref).length, 1);
 

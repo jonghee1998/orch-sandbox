@@ -578,7 +578,11 @@ async function commitAndPush() {
 
   git("add", "-A");
   const staged = git("diff", "--cached", "--name-only");
-  if (staged) git("commit", "-m", `Run #${n} step ${step}: ${env.MODE === "fix" ? "address review findings" : "implement"}`);
+  const claudeCommitted = git("rev-parse", "HEAD") !== startSha;
+  // The summary also goes into the commit message, so a recovery path can rebuild the PR body.
+  const message = `Run #${n} step ${step}: ${env.MODE === "fix" ? "address review findings" : "implement"}${summary ? `\n\n${summary}` : ""}`;
+  if (staged) git("commit", "-m", message);
+  else if (claudeCommitted && summary) git("commit", "--allow-empty", "-m", message);
 
   const changedFiles = git("diff", "--name-only", `${startSha}..HEAD`).split("\n").filter(Boolean);
   const prot = C.touchesProtected(changedFiles);
@@ -647,7 +651,9 @@ async function recoverPushedWork(run) {
       `♻️ Step ${st.step} PR #${open[0].number}을 찾아 검증 단계로 이어갑니다.`);
     return true;
   }
-  await openStepPR(run, branch, "", " (구현 결과를 복구해서)");
+  const last = cmp.commits?.at(-1)?.commit?.message ?? "";
+  const summary = last.includes("\n\n") ? last.slice(last.indexOf("\n\n") + 2) : "";
+  await openStepPR(run, branch, summary, " (구현 결과를 복구해서)");
   return true;
 }
 
