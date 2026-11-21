@@ -70,7 +70,7 @@ jobs:
           claude_args: >-
             --max-turns 80
             ${{ steps.prep.outputs.model_args }}
-            --allowedTools "Edit,Write,Read,Glob,Grep,LS,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*)"
+            --allowedTools "Edit,Write,Read,Glob,Grep,LS,Skill,Task,Agent,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*)"
       - name: Commit and push
         id: commit
         if: steps.prep.outputs.skip != 'true'
