@@ -248,3 +248,13 @@ test("codexVerdict: plain-text usage-limit notice counts as Codex unavailable", 
   const fake = { ...limit("2026-11-21T00:00:00Z"), user: { login: bot.login, id: 1 } };
   assert.equal(C.codexVerdict([fake], H1).result, "none", "untrusted author ignored");
 });
+
+test("readState: a plan that mentions the marker in prose does not hide the real state (run #239)", () => {
+  const prose = "context: 상태 마커는 <!-- orch-state:v1 --> 마커(passed 객체)이다.\n\n```json\n{}\n```";
+  const real = C.stateMarker({ v: 1, status: "implementing", step: 1 });
+  assert.equal(C.readState(`${prose}\n${real}`).status, "implementing");
+  assert.equal(C.readState(`${C.stateMarker({ v: 1, status: "old" })}\n${real}`).status, "implementing", "last valid marker wins");
+  assert.equal(C.readState(prose), null);
+  assert.match(C.stripManaged(`${prose}\n${real}`), /<!-- orch-state:v1 --> 마커/, "prose kept, real marker removed");
+  assert.doesNotMatch(C.stripManaged(`${prose}\n${real}`), /"status"/);
+});
