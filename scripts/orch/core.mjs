@@ -299,15 +299,23 @@ export function parseCodexState(body) {
  * If that latest marker is for another SHA, the head has no verdict yet ("none").
  * @returns {{result: "none"|"pending"|"pass"|"fail"|"error", status?: string, url?: string}}
  */
+const CODEX_LIMIT_RE = /reached your Codex usage limits?|usage limits? for code reviews?/i;
+
 export function codexVerdict(comments, headSha) {
   let best = null;
+  let limit = null; // plain-text "usage limits" notice (no state marker)
   for (const c of comments ?? []) {
     if (!isTrustedCodex(c.user)) continue;
-    const s = parseCodexState(c.body);
-    if (!s) continue;
     const at = c.updated_at ?? c.created_at ?? "";
+    const s = parseCodexState(c.body);
+    if (!s) {
+      if (CODEX_LIMIT_RE.test(c.body ?? "") && (!limit || at > limit.at)) limit = { at, url: c.html_url };
+      continue;
+    }
     if (!best || at > best.at) best = { ...s, at, url: c.html_url };
   }
+  // A limit notice newer than any review of the current head means Codex cannot review it.
+  if (limit && (!best || best.sha !== headSha || limit.at > best.at)) return { result: "error", status: "usage_limit", url: limit.url };
   if (!best || best.sha !== headSha) return { result: "none" };
   if (best.status === "completed") return { result: best.unresolved ? "fail" : "pass", status: best.status, url: best.url };
   if (best.status === "failed") return { result: "error", status: best.status, url: best.url };

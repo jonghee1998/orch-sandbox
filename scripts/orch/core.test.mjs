@@ -235,3 +235,16 @@ test("switches: parsing, time window (KST, wraps midnight, fail-closed), model r
   assert.equal(C.reviewRoute({ codex: false, opus: true }, false), "claude");
   assert.equal(C.reviewRoute({ codex: false, opus: false }, false), null);
 });
+
+test("codexVerdict: plain-text usage-limit notice counts as Codex unavailable", () => {
+  const H1 = "1".repeat(40), H0 = "0".repeat(40);
+  const bot = { login: C.CODEX_BOT.login, id: C.CODEX_BOT.id, type: "Bot" };
+  const limit = (at) => ({ user: bot, body: "You have reached your Codex usage limits for code reviews. You can see your limits in the dashboard.", created_at: at, updated_at: at, html_url: "u" });
+  const state = (sha, at, status = "completed") => ({ user: bot, created_at: at, updated_at: at, html_url: "s",
+    body: `<!-- codex-review-state:v1 ${JSON.stringify({ code_review: { status, commit_sha: sha, has_unresolved_findings: false } })} -->` });
+  assert.deepEqual(C.codexVerdict([limit("2026-11-21T00:00:00Z")], H1), { result: "error", status: "usage_limit", url: "u" });
+  assert.equal(C.codexVerdict([limit("2026-11-21T00:00:00Z"), state(H1, "2026-11-21T01:00:00Z")], H1).result, "pass", "review after the notice wins");
+  assert.equal(C.codexVerdict([state(H0, "2026-11-20T23:00:00Z"), limit("2026-11-21T00:00:00Z")], H1).result, "error");
+  const fake = { ...limit("2026-11-21T00:00:00Z"), user: { login: bot.login, id: 1 } };
+  assert.equal(C.codexVerdict([fake], H1).result, "none", "untrusted author ignored");
+});
