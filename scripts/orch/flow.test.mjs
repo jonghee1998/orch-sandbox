@@ -114,6 +114,7 @@ function fakeGitHub() {
     if ((m = /^\/commits\/([a-f0-9]+)\/check-runs$/.exec(p))) return json(200, { check_runs: page > 1 ? [] : db.checks[m[1]] ?? [] });
     if (p === "/actions/workflows/claude-work.yml/dispatches") { db.dispatches.push(body.inputs); return json(204); }
     if (p === "/actions/workflows/claude-review.yml/dispatches") { db.reviews.push(body.inputs); return json(204); }
+    if (p === "/actions/workflows/final-sync.yml/dispatches") { (db.syncs ??= []).push(body.inputs); return json(204); }
     if (p === "/actions/workflows/claude-work.yml/runs") {
       const status = u.searchParams.get("status");
       return json(200, { workflow_runs: page > 1 ? [] : (db.workRuns ?? []).filter((w) => !status || w.status === status) });
@@ -242,7 +243,7 @@ test("happy path with one fix round: start -> PR -> FAIL -> fix -> PASS -> next 
   assert.equal(state(n).status, "done");
   assert.equal(db.issues[n].state, "closed");
   assert.deepEqual(labels(n), ["orch:done"]);
-  assert.match(db.notifications.at(-1).title, /자동 머지/);
+  assert.match(db.notifications.at(-1).title, /자동 반영/);
 });
 
 test("high risk (new dependency + auth file) -> awaiting owner with report; owner merge -> done", async () => {
@@ -571,4 +572,35 @@ test("watchdog: implement run that ended without pushing (stale state read) is d
   await fire("schedule", {});
   assert.equal(mine(), before + 1, "not again");
   db.workRuns = [];
+});
+
+test("final PR conflicts with main: final-sync once per head, then block if it could not resolve", async () => {
+  const ACT = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("e");
+  await publish(n, "implement", 1);
+  const pr1 = state(n).pr;
+  ciPass(sha("e"));
+  await codexSays(pr1, sha("e"), "completed", false);
+  assert.equal(state(n).status, "finalizing");
+  const final = db.issues[state(n).finalPr];
+  final.mergeable = false;                             // another run landed on main first
+  ciPass(final.head.sha);
+  await ciDone(final.number);
+  assert.equal(state(n).status, "finalizing", "not merged while conflicted");
+  assert.equal(db.syncs.at(-1).pr, String(final.number));
+  assert.equal(state(n).syncFor, final.head.sha);
+  const syncs = db.syncs.length;
+  await ciDone(final.number);
+  assert.equal(db.syncs.length, syncs, "same head: not dispatched again");
+  db.addComment(final.number, C.finalSyncMarker({ head: final.head.sha, ok: false, files: ["src/a.ts"] }), { login: "x", id: 5, type: "User" });
+  await ciDone(final.number);
+  assert.equal(state(n).status, "finalizing", "a person's comment cannot fake the result");
+  db.addComment(final.number, C.finalSyncMarker({ head: final.head.sha, ok: false, files: ["src/a.ts"] }), ACT);
+  await ciDone(final.number);
+  assert.equal(state(n).status, "blocked");
+  assert.match(state(n).reason, /충돌.*src\/a\.ts/);
+  assert.equal(state(n).blockKind, "final");
 });

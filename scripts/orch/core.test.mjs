@@ -258,3 +258,17 @@ test("readState: a plan that mentions the marker in prose does not hide the real
   assert.match(C.stripManaged(`${prose}\n${real}`), /<!-- orch-state:v1 --> 마커/, "prose kept, real marker removed");
   assert.doesNotMatch(C.stripManaged(`${prose}\n${real}`), /"status"/);
 });
+
+test("resolvePatchNotes: keeps both sides newest-first; refuses same version or non-entry conflicts", () => {
+  const e = (v) => `  { version: "${v}", date: "2026-11-21", title: "t${v}", items: ["x"] },`;
+  const file = (mid) => ["export const PATCH_NOTES = [", ...mid, e("1.12.0"), "];"].join("\n");
+  const conflicted = file(["<<<<<<< HEAD", e("1.13.0"), "=======", e("1.12.1"), ">>>>>>> origin/main"]);
+  assert.equal(C.resolvePatchNotes(conflicted), file([e("1.13.0"), e("1.12.1")]));
+  const reversed = file(["<<<<<<< HEAD", e("1.12.1"), "=======", e("1.13.0"), ">>>>>>> origin/main"]);
+  assert.equal(C.resolvePatchNotes(reversed), file([e("1.13.0"), e("1.12.1")]), "sorted by version, not by side");
+  assert.equal(C.resolvePatchNotes(file(["<<<<<<< HEAD", e("1.13.0"), "=======", e("1.13.0").replace("t1", "u1"), ">>>>>>> m"])), null);
+  assert.equal(C.resolvePatchNotes(file(["<<<<<<< HEAD", "const x = 1;", "=======", e("1.13.0"), ">>>>>>> m"])), null);
+  assert.equal(C.resolvePatchNotes(file(["<<<<<<< HEAD", e("1.13.0")])), null, "unterminated");
+  assert.equal(C.finalSyncResult([{ user: { id: 41898282, type: "Bot" }, body: C.finalSyncMarker({ head: "h", ok: false, files: [] }) }], "h").ok, false);
+  assert.equal(C.finalSyncResult([{ user: { id: 41898282, type: "Bot" }, body: C.finalSyncMarker({ head: "h", ok: false, files: [] }) }], "other"), null);
+});
