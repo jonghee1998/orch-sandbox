@@ -604,3 +604,24 @@ test("final PR conflicts with main: final-sync once per head, then block if it c
   assert.match(state(n).reason, /충돌.*src\/a\.ts/);
   assert.equal(state(n).blockKind, "final");
 });
+
+test("blocked on a final conflict, low risk: orch:go after the conflict is gone returns to the automatic path", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  db.refs[C.stepBranch(n, 1)] = sha("f");
+  await publish(n, "implement", 1);
+  ciPass(sha("f"));
+  await codexSays(state(n).pr, sha("f"), "completed", false);
+  const final = db.issues[state(n).finalPr];
+  final.mergeable = false;
+  ciPass(final.head.sha);
+  await ciDone(final.number);
+  db.addComment(final.number, C.finalSyncMarker({ head: final.head.sha, ok: false, files: ["src/lib/patchnotes.ts"] }), { login: "github-actions[bot]", id: 41898282, type: "Bot" });
+  await ciDone(final.number);
+  assert.equal(state(n).status, "blocked");
+  final.mergeable = true;                               // PM resolved the conflict
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue: db.issues[n] });
+  assert.equal(state(n).status, "done", "auto path resumed and merged");
+  assert.ok(final.merged_at);
+});

@@ -716,9 +716,22 @@ export function resolvePatchNotes(text) {
   }
   const idx = out.map((l, i) => (isEntry(l) ? i : -1)).filter((i) => i >= 0);
   const ver = (l) => /version: "(\d+)\.(\d+)\.(\d+)"/.exec(l).slice(1).map(Number);
+  // Same entry on both sides that differs only by the PM-filled `pr: N` → keep the one with the PR number.
+  const withoutPr = (l) => l.replace(/ pr: \d+,/, "");
+  const byVer = new Map();
+  for (const i of idx) {
+    const k = ver(out[i]).join(".");
+    const prev = byVer.get(k);
+    if (prev === undefined) { byVer.set(k, i); continue; }
+    if (withoutPr(out[prev]) !== withoutPr(out[i])) return null;   // same version, different content: a person decides
+    const keep = / pr: \d+,/.test(out[i]) ? i : prev;
+    out[keep === i ? prev : i] = null;
+    byVer.set(k, keep);
+  }
+  for (let i = out.length - 1; i >= 0; i--) if (out[i] === null) out.splice(i, 1);
+  const idx2 = out.map((l, i) => (isEntry(l) ? i : -1)).filter((i) => i >= 0);
+  idx.length = 0; idx.push(...idx2);
   const entries = idx.map((i) => out[i]);
-  const keys = entries.map((l) => ver(l).join("."));
-  if (new Set(keys).size !== keys.length) return null;             // same version added twice: a person decides
   entries.sort((a, b) => { const x = ver(a), y = ver(b); return y[0] - x[0] || y[1] - x[1] || y[2] - x[2]; });
   idx.forEach((i, k) => { out[i] = entries[k]; });
   return out.join("\n");

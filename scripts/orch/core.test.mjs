@@ -272,3 +272,12 @@ test("resolvePatchNotes: keeps both sides newest-first; refuses same version or 
   assert.equal(C.finalSyncResult([{ user: { id: 41898282, type: "Bot" }, body: C.finalSyncMarker({ head: "h", ok: false, files: [] }) }], "h").ok, false);
   assert.equal(C.finalSyncResult([{ user: { id: 41898282, type: "Bot" }, body: C.finalSyncMarker({ head: "h", ok: false, files: [] }) }], "other"), null);
 });
+
+test("resolvePatchNotes: same entry on both sides, one with the PR number filled in → keep that one (run #254)", () => {
+  const e = (v, pr) => `  { version: "${v}", date: "2026-11-21",${pr ? ` pr: ${pr},` : ""} title: "t${v}", items: ["x"] },`;
+  const file = (mid) => ["export const PATCH_NOTES = [", ...mid, e("1.13.0", 249), "];"].join("\n");
+  const conflicted = file(["<<<<<<< HEAD", e("1.15.0"), e("1.13.1"), "=======", e("1.14.0", 253), e("1.13.1", 255), ">>>>>>> origin/main"]);
+  assert.equal(C.resolvePatchNotes(conflicted), file([e("1.15.0"), e("1.14.0", 253), e("1.13.1", 255)]));
+  const reversed = file(["<<<<<<< HEAD", e("1.13.1", 255), "=======", e("1.13.1"), ">>>>>>> m"]);
+  assert.equal(C.resolvePatchNotes(reversed), file([e("1.13.1", 255)]));
+});
