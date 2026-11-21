@@ -366,7 +366,7 @@ async function openFinal(run) {
     }
     const info = st.stepInfo?.[s.id] ?? {};
     const usedModel = C.pickModel(plan, s.id, info.retries ?? 0).model;
-    steps.push({ id: s.id, title: s.title, pr: prNum, summary, unmet, model: usedModel, reviewer: REVIEWER_SHORT[info.reviewer] ?? "-", retries: info.retries ?? 0 });
+    steps.push({ id: s.id, title: s.title, pr: prNum, summary, unmet, model: usedModel, ecc: C.eccCell(prObj?.body), reviewer: REVIEWER_SHORT[info.reviewer] ?? "-", retries: info.retries ?? 0 });
   }
 
   const final = await gh().post("/pulls", {
@@ -679,14 +679,14 @@ async function resolveCodexThreads(prNumber) {
   return threads.length;
 }
 
-async function openStepPR(run, branch, summary, note = "") {
+async function openStepPR(run, branch, summary, note = "", tools = env.TOOLS ?? "") {
   const step = run.state.step;
   const step0 = run.plan.steps.find((s) => s.id === step);
   const pr = await gh().post("/pulls", {
     title: `[run #${run.n}] Step ${step}: ${step0.title}`,
     head: branch,
     base: C.runBranch(run.n),
-    body: C.prBody(run.n, run.plan, step, summary),
+    body: C.prBody(run.n, run.plan, step, summary, tools),
   });
   await save(run, { status: "reviewing", pr: pr.number, reviewRequestedAt: now(), nudged: [] },
     `📝 Step ${step} PR #${pr.number}을 열었습니다${note}. Codex 리뷰와 CI를 기다립니다.`);
@@ -737,7 +737,7 @@ async function publish() {
   if (mode === "implement") return openStepPR(run, env.BRANCH, env.SUMMARY);
 
   const resolved = await resolveCodexThreads(st.pr).catch((e) => (log("resolve threads failed", e.message), 0));
-  if (env.SUMMARY) await gh().post(`/issues/${st.pr}/comments`, { body: `${C.LOG_MARK}\n**수정 ${st.retries}회차 반영**\n\n${env.SUMMARY}` });
+  if (env.SUMMARY || env.TOOLS) await gh().post(`/issues/${st.pr}/comments`, { body: `${C.LOG_MARK}\n**수정 ${st.retries}회차 반영**\n\n${env.SUMMARY ?? ""}${env.TOOLS ? `\n\n### 도구 사용 (자동 기록)\n${env.TOOLS}` : ""}` });
   await askCodex(st.pr);
   await save(run, { status: "reviewing", reviewRequestedAt: now(), nudged: [] },
     `🔍 Step ${step} 수정 커밋을 푸시하고 재검증을 요청했습니다 (PR #${st.pr}, 기존 Codex 스레드 ${resolved}건 resolve).`);
