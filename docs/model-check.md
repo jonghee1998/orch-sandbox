@@ -1,2 +1,2 @@
-model: claude-sonnet-5-5
-round: 1
+model: claude-opus-5-5
+round: 2
