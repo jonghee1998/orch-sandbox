@@ -29,6 +29,7 @@ jobs:
       blocked: ${{ steps.commit.outputs.blocked }}
       summary: ${{ steps.commit.outputs.summary }}
       tools: ${{ steps.tools.outputs.tools }}
+      model: ${{ steps.prep.outputs.model }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -129,6 +130,7 @@ jobs:
           BLOCKED: ${{ needs.work.outputs.blocked }}
           SUMMARY: ${{ needs.work.outputs.summary }}
           TOOLS: ${{ needs.work.outputs.tools }}
+          MODEL: ${{ needs.work.outputs.model }}
           ORCH_SONNET: ${{ vars.ORCH_SONNET }}
           ORCH_OPUS: ${{ vars.ORCH_OPUS }}
           ORCH_CODEX: ${{ vars.ORCH_CODEX }}

@@ -613,6 +613,7 @@ async function prepare() {
   const pick = resolved.hold ? picked : resolved;
   log(`model: ${pick.model} (${pick.why})`);
   setOutput("model_args", `--model ${pick.model}`);
+  setOutput("model", `${pick.model} (${pick.why})`);
   setOutput("prompt", prompt);
 }
 
@@ -686,7 +687,7 @@ async function openStepPR(run, branch, summary, note = "", tools = env.TOOLS ?? 
     title: `[run #${run.n}] Step ${step}: ${step0.title}`,
     head: branch,
     base: C.runBranch(run.n),
-    body: C.prBody(run.n, run.plan, step, summary, tools),
+    body: C.prBody(run.n, run.plan, step, summary, tools, env.MODEL ?? ""),
   });
   await save(run, { status: "reviewing", pr: pr.number, reviewRequestedAt: now(), nudged: [] },
     `📝 Step ${step} PR #${pr.number}을 열었습니다${note}. Codex 리뷰와 CI를 기다립니다.`);
@@ -737,7 +738,7 @@ async function publish() {
   if (mode === "implement") return openStepPR(run, env.BRANCH, env.SUMMARY);
 
   const resolved = await resolveCodexThreads(st.pr).catch((e) => (log("resolve threads failed", e.message), 0));
-  if (env.SUMMARY || env.TOOLS) await gh().post(`/issues/${st.pr}/comments`, { body: `${C.LOG_MARK}\n**수정 ${st.retries}회차 반영**\n\n${env.SUMMARY ?? ""}${env.TOOLS ? `\n\n### 도구 사용 (자동 기록)\n${env.TOOLS}` : ""}` });
+  if (env.SUMMARY || env.TOOLS || env.MODEL) await gh().post(`/issues/${st.pr}/comments`, { body: `${C.LOG_MARK}\n**수정 ${st.retries}회차 반영**${env.MODEL ? ` · 구현 모델: ${env.MODEL}` : ""}\n\n${env.SUMMARY ?? ""}${env.TOOLS ? `\n\n### 도구 사용 (자동 기록)\n${env.TOOLS}` : ""}` });
   await askCodex(st.pr);
   await save(run, { status: "reviewing", reviewRequestedAt: now(), nudged: [] },
     `🔍 Step ${step} 수정 커밋을 푸시하고 재검증을 요청했습니다 (PR #${st.pr}, 기존 Codex 스레드 ${resolved}건 resolve).`);
@@ -772,7 +773,7 @@ async function reviewPublish() {
   const verdict = parsed?.verdict ?? "ERROR";
   const summary = parsed?.summary ?? `검수 결과 파일이 없거나 형식이 잘못되었습니다 (Claude 실행 결과: ${env.CLAUDE_OUTCOME}).`;
   await ro().post(`/issues/${env.PR}/comments`, {
-    body: C.claudeReviewComment({ sha, verdict, summary, findings: parsed?.findings ?? [], runUrl: RUN_URL }),
+    body: C.claudeReviewComment({ sha, verdict, summary, findings: parsed?.findings ?? [], runUrl: RUN_URL, tools: env.TOOLS ?? "" }),
   });
   log(`claude review ${verdict} for ${sha.slice(0, 7)}`);
 }

@@ -410,11 +410,12 @@ export function fixPrompt(plan, stepId, { round, maxRetries, findings, reviewBod
   ].filter(Boolean).join("\n\n");
 }
 
-export function prBody(n, plan, stepId, summary, tools = "") {
+export function prBody(n, plan, stepId, summary, tools = "", model = "") {
   const step = plan.steps.find((s) => s.id === stepId);
   return [
     prMarker(n, stepId),
     `Run #${n} · Step ${stepId}/${plan.steps.length}: **${step.title}**`,
+    ...(model ? [`구현 모델: ${model}`] : []),
     "",
     summary?.trim() || "_(Claude가 SUMMARY를 남기지 않았습니다)_",
     "",
@@ -620,6 +621,15 @@ export function parseReviewFile(text) {
   return { verdict: j.verdict, summary: String(j.summary ?? "").slice(0, 3000), findings: clean };
 }
 
+/** How the fallback reviewer may use the repo's review sub-agents (copied from main, not from the PR). */
+export const REVIEW_AGENTS = ["code-reviewer", "security-reviewer", "typescript-reviewer", "react-reviewer"];
+const REVIEW_AGENT_RULES = [
+  "## 보조 검토 에이전트 (있으면 사용)",
+  `- \`.claude/agents/\`에 ${REVIEW_AGENTS.map((a) => `\`${a}\``).join(", ")}가 있으면, 변경에 맞는 것을 Task 도구로 불러 보조 검토를 맡긴다: 모든 변경 → \`code-reviewer\`, 인증·입력 처리·API·비밀값·권한·워크플로 → \`security-reviewer\`, .ts/.js → \`typescript-reviewer\`, .tsx/.jsx → \`react-reviewer\`. 각 에이전트에는 비교 기준(\`git diff <base>...HEAD\`)과 스텝의 완료 기준을 함께 준다.`,
+  "- 보조 에이전트에게는 코드를 수정하지 말고 지적만 하라고 지시한다. 에이전트의 지적은 직접 코드로 확인한 것만 findings에 넣는다. 최종 판정은 너 자신이 내린다.",
+  "- 에이전트 지시가 이 검수 지시와 충돌하면 이 지시가 우선한다.",
+];
+
 export function reviewPrompt(plan, stepId, baseRef) {
   const step = plan.steps.find((s) => s.id === stepId);
   return [
@@ -631,6 +641,7 @@ export function reviewPrompt(plan, stepId, baseRef) {
     "- `npm test`를 실행해 결과를 확인한다.",
     "- 완료 기준을 하나씩 실제 코드와 테스트로 확인한다. 테스트가 기준을 실제로 검증하는지도 본다.",
     "- 버그, 엣지 케이스 누락, 보안 문제, 스텝 범위 밖 변경을 찾는다. 스타일·취향만으로는 FAIL하지 않는다.",
+    ...REVIEW_AGENT_RULES,
     "## 결과 (반드시 작성)",
     "`.orch/REVIEW.json`에 아래 JSON만 쓴다:",
     '{"verdict":"PASS"|"FAIL","summary":"판정 근거 2~4줄","findings":[{"path":"src/x.mjs","line":12,"body":"무엇이 왜 문제이고 기대 동작은 무엇인지"}]}',
@@ -638,7 +649,7 @@ export function reviewPrompt(plan, stepId, baseRef) {
   ].join("\n\n");
 }
 
-export function claudeReviewComment({ sha, verdict, summary, findings, runUrl }) {
+export function claudeReviewComment({ sha, verdict, summary, findings, runUrl, tools = "" }) {
   const head = verdict === "PASS" ? "✅ PASS" : verdict === "FAIL" ? "❌ FAIL" : "⚠️ ERROR";
   const list = (findings ?? []).map((f, i) => `${i + 1}. \`${f.path}${f.line ? `:${f.line}` : ""}\` — ${f.body}`);
   return [
@@ -649,6 +660,7 @@ export function claudeReviewComment({ sha, verdict, summary, findings, runUrl })
     summary || "",
     list.length ? `\n**지적 사항**\n${list.join("\n")}` : "",
     "",
+    ...(tools ? ["### 도구 사용 (자동 기록)", tools, ""] : []),
     `[실행 로그](${runUrl})`,
   ].join("\n");
 }
