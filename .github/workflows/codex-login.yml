@@ -50,8 +50,15 @@ jobs:
           MSG="📱 **Codex 로그인 승인** — 15분 안에
           1. 폰에서 열기: ${URL:-로그인 주소를 찾지 못함}
           2. 코드 입력: **${CODE:-?}**"
+          # Visible right away in the live log (the step summary only renders after the job ends).
+          echo "::notice title=Codex 로그인 코드::${URL:-?}  코드: ${CODE:-?}"
+          echo "$MSG"
           echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
           ISSUE=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=orch:usage&state=open&per_page=1" --jq '.[0].number // empty')
+          if [ -z "$ISSUE" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/labels" -f name=orch:usage -f color=c2e0c6 -f description="AI 사용량 스냅샷 (자동)" --silent 2>/dev/null || true
+            ISSUE=$(gh api "repos/$GITHUB_REPOSITORY/issues" -f title="[orch] AI 사용량 (자동 갱신)" -f body="사용량 스냅샷이 곧 여기에 기록됩니다." -f "labels[]=orch:usage" --jq .number)
+          fi
           [ -n "$ISSUE" ] && gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE/comments" -f body="$MSG" --silent
           for i in $(seq 1 90); do kill -0 $LP 2>/dev/null || break; sleep 10; done
           wait $LP; rc=$?
