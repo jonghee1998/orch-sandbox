@@ -1,0 +1,91 @@
+# 최종 PR이 main과 충돌할 때 orchestrator가 부른다: run 브랜치에 main을 합치고,
+# 충돌이 패치노트(src/lib/patchnotes.ts)뿐이면 자동으로 풀어(양쪽 항목 유지, 최신 버전 순) 푸시한다.
+# 그 밖의 충돌은 손대지 않고 결과만 댓글로 남긴다 → orchestrator가 중단하고 사용자에게 알린다.
+name: final-sync
+run-name: "final-sync #${{ inputs.issue }} pr ${{ inputs.pr }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue: { required: true, type: string }
+      pr: { required: true, type: string }
+
+permissions: {}
+
+concurrency:
+  group: final-sync-${{ inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: write   # wake the orchestrator
+    steps:
+      - name: Trusted orchestrator scripts (from main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: .orch-main
+          persist-credentials: false
+          sparse-checkout: scripts/orch
+      - name: Keep trusted scripts outside the work tree
+        run: cp -r .orch-main/scripts/orch "$RUNNER_TEMP/orch" && rm -rf .orch-main
+      - name: PR head branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+        run: |
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '.head.ref')
+          case "$ref" in orch/run-*) ;; *) echo "::error::not an orchestrator run branch: $ref"; exit 1;; esac
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT }}   # push with the owner PAT so CI runs on the new head
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Merge main
+        id: merge
+        run: |
+          git config user.name "orch-bot"
+          git config user.email "orch-bot@users.noreply.github.com"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git fetch origin main
+          if git merge --no-edit origin/main; then echo "ok=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+          if node "$RUNNER_TEMP/orch/final-sync.mjs" resolve $files; then
+            git add -- $files
+            git commit --no-edit -m "Merge main into ${{ steps.pr.outputs.ref }} (패치노트 충돌 자동 정리)"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Push
+        if: steps.merge.outputs.ok == 'true'
+        run: git push origin HEAD:${{ steps.pr.outputs.ref }}
+      - name: Report
+        if: always()
+        run: node "$RUNNER_TEMP/orch/final-sync.mjs" report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          HEAD: ${{ steps.merge.outputs.head }}
+          OK: ${{ steps.merge.outputs.ok == 'true' }}
+          FILES: ${{ steps.merge.outputs.files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Wake the orchestrator
+        if: always()
+        run: gh workflow run orchestrator.yml --ref main -f pr="$PR" -R "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}

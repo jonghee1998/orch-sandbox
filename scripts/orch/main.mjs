@@ -171,14 +171,14 @@ async function start(run, sender) {
     return;
   }
   if (st?.status === "awaiting_merge") {
-    await comment(run.n, `ℹ️ 모든 스텝이 끝나 최종 PR #${st.finalPr} 머지를 기다리고 있습니다.`);
+    await comment(run.n, `ℹ️ 모든 스텝이 끝나 최종 PR #${st.finalPr} 반영(Merge)을 기다리고 있습니다.`);
     return;
   }
 
   // Resume from blocked
   if (st?.status === "blocked" && st.blockKind === "final") {
     await save(run, { status: "awaiting_merge", reason: null },
-      `▶️ 자동 머지를 멈추고 수동 머지 대기로 바꿨습니다. 최종 PR #${st.finalPr}을 확인해 주세요.`);
+      `▶️ 자동 반영을 멈추고 사용자 반영 대기로 바꿨습니다. 최종 PR #${st.finalPr}을 확인해 주세요.`);
     await setLabels(run.n, [C.LABELS.run], [C.LABELS.blocked]);
     return;
   }
@@ -314,7 +314,7 @@ async function onPass(run, pr, reviewer = "codex") {
     const fresh = (await loadRun(run.n)).state;
     if (again.merged_at && fresh?.step !== st.step) return log(`PR #${pr.number} already merged and handled`);
     if (!again.merged_at) {
-      return block(run, `스텝 PR 머지 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "work");
+      return block(run, `스텝 PR 합치기 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "work");
     }
     log(`PR #${pr.number} merged by a concurrent run; continuing`);
   }
@@ -378,20 +378,46 @@ async function openFinal(run) {
 
   if (autoMerge) {
     await save(run, { status: "finalizing", pr: null, finalPr: final.number, risk: risk.level },
-      `🎉 전체 ${plan.steps.length}개 스텝 통과. 위험 낮음 → 최종 PR #${final.number}의 CI가 통과하면 자동 머지합니다.`);
+      `🎉 전체 ${plan.steps.length}개 스텝 통과. 위험 낮음 → 최종 PR #${final.number}의 CI가 통과하면 자동 반영합니다.`);
     return;
   }
   const why = risk.reasons.length ? risk.reasons.map((r) => r.reason).join(", ") : "auto_merge: false";
   await save(run, { status: "awaiting_merge", pr: null, finalPr: final.number, risk: risk.level },
-    `🟡 전체 ${plan.steps.length}개 스텝 통과. **확인 필요** (${why}) → 최종 PR #${final.number}의 완공 보고서를 보고 머지해 주세요.`);
+    `🟡 전체 ${plan.steps.length}개 스텝 통과. **확인 필요** (${why}) → 최종 PR #${final.number}의 완공 보고서를 보고 반영해 주세요 (PR의 Merge 버튼).`);
   await notify(`🟡 Run #${run.n} 승인 필요`, `${plan.goal} — ${why}. 최종 PR #${final.number}`, final.html_url);
 }
 
 /** Final PR (run branch -> main) of a low-risk run: merge once its CI passes. */
+/**
+ * Final PR conflicts with main (another run landed first). GitHub runs no CI on a conflicted PR, so without this the
+ * run waits forever. First time for a head: ask final-sync.yml to merge main in (it auto-resolves patch-note-only
+ * conflicts). If that fails or nothing changes within 15 minutes, stop and ask the user.
+ * @returns {Promise<boolean>} true when the caller must not proceed (conflict being handled or blocked)
+ */
+async function handleFinalConflict(run, pr) {
+  const fresh = pr.mergeable === undefined ? await gh().get(`/pulls/${pr.number}`) : pr;
+  if (fresh.mergeable !== false) return false;               // true = clean; null = GitHub still computing
+  const st = run.state, head = fresh.head.sha;
+  if (st.syncFor !== head) {
+    await save(run, { syncFor: head, syncAt: now() },
+      `🔀 최종 PR #${pr.number}이 main과 충돌합니다 (그사이 다른 작업이 반영됨). main을 합쳐 자동 정리를 시도합니다.`);
+    await ro().post(`/actions/workflows/final-sync.yml/dispatches`, { ref: "main", inputs: { issue: String(run.n), pr: String(pr.number) } });
+    return true;
+  }
+  const comments = await ro().all(`/issues/${pr.number}/comments?per_page=100`);
+  const failed = C.finalSyncResult(comments, head);
+  if (failed?.ok === false || minutesSince(st.syncAt) > 15) {
+    const files = failed?.files?.length ? ` (${failed.files.join(", ")})` : "";
+    await block(run, `최종 PR이 main과 충돌해 자동 정리하지 못했습니다${files}. 충돌을 풀고 orch:go를 다시 붙여 주세요.`, fresh.html_url, "final");
+  }
+  return true;
+}
+
 async function evaluateFinal(pr, n) {
   const run = await loadRun(n);
   const st = run?.state;
   if (!st || st.status !== "finalizing" || st.finalPr !== pr.number) return;
+  if (await handleFinalConflict(run, pr)) return;
   const ci = C.ciVerdict(await ro().all(`/commits/${pr.head.sha}/check-runs`), SELF_CHECKS);
   log(`final PR #${pr.number}: ci=${ci.result} mergeable=${pr.mergeable}`);
   if (ci.result === "pending" || ci.result === "none") return;
@@ -407,11 +433,11 @@ async function evaluateFinal(pr, n) {
   } catch (e) {
     const again = await gh().get(`/pulls/${pr.number}`);
     if (!again.merged_at) {
-      return block(run, `최종 PR 자동 머지 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "final");
+      return block(run, `최종 PR 자동 반영 실패 (${e.status}): ${C.oneLine(e.message, 200)}`, pr.html_url, "final");
     }
   }
-  await finishRun(run, `🏁 최종 PR #${pr.number}을 자동 머지했습니다 (위험 낮음, CI 통과). 완료!`);
-  await notify(`✅ Run #${run.n} 완료 (자동 머지)`, `${run.plan.goal}`, pr.html_url);
+  await finishRun(run, `🏁 최종 PR #${pr.number}을 main에 자동 반영했습니다 (위험 낮음, CI 통과). 완료!`);
+  await notify(`✅ Run #${run.n} 완료 (자동 반영)`, `${run.plan.goal}`, pr.html_url);
 }
 
 async function finishRun(run, line) {
@@ -506,10 +532,11 @@ async function watchOne(n) {
 
   if (["awaiting_merge", "finalizing"].includes(st.status) && st.finalPr) {
     const pr = await gh().get(`/pulls/${st.finalPr}`, { allow404: true });
+    if (st.status === "awaiting_merge" && pr?.state === "open" && !pr.merged_at && (await handleFinalConflict(run, pr))) return;
     if (pr?.merged_at) {
-      await finishRun(run, `🏁 최종 PR #${pr.number}이 머지되어 완료 처리했습니다.`);
+      await finishRun(run, `🏁 최종 PR #${pr.number}이 반영되어 완료 처리했습니다.`);
     } else if (pr?.state === "closed") {
-      await save(run, { status: "cancelled", reason: "최종 PR이 머지 없이 닫힘" }, "🚫 최종 PR이 머지 없이 닫혀 run을 종료했습니다.");
+      await save(run, { status: "cancelled", reason: "최종 PR이 반영 없이 닫힘" }, "🚫 최종 PR이 반영 없이 닫혀 run을 종료했습니다.");
       await setLabels(n, [], [C.LABELS.run]);
     }
   }

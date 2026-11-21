@@ -229,8 +229,8 @@ const STATUS_TEXT = {
   reviewing: "🔍 검증 중 (Codex + CI)",
   fixing: "🛠️ 수정 중 (Claude)",
   blocked: "⛔ 중단 — 판단 필요",
-  finalizing: "🟢 전체 통과 — 최종 CI 확인 후 자동 머지",
-  awaiting_merge: "🟡 전체 통과 — 머지 승인 대기 (완공 보고서 확인)",
+  finalizing: "🟢 전체 통과 — 최종 CI 확인 후 자동 반영",
+  awaiting_merge: "🟡 전체 통과 — 반영 승인 대기 (완공 보고서 확인)",
   done: "🏁 완료",
   cancelled: "🚫 취소됨",
 };
@@ -426,7 +426,7 @@ export function prBody(n, plan, stepId, summary, tools = "", model = "") {
     "---",
     `완료 기준:\n${step.done_when.map((x) => `- ${x}`).join("\n")}`,
     "",
-    `_orchestrator가 생성한 스텝 PR입니다. Codex 검증과 CI를 통과하면 \`${runBranch(n)}\`에 자동 머지됩니다._`,
+    `_orchestrator가 생성한 스텝 PR입니다. Codex 검증과 CI를 통과하면 \`${runBranch(n)}\`에 자동으로 합쳐집니다._`,
   ].join("\n");
 }
 
@@ -521,10 +521,10 @@ export function filesSummary(files) {
  */
 export function finalReport({ n, plan, steps, risk, autoMerge }) {
   const verdict = autoMerge
-    ? "🟢 **위험 낮음 → 최종 CI 통과 시 자동 머지됩니다.** 확인할 필요는 없지만, 아래 '확인 방법'으로 써볼 수 있습니다."
+    ? "🟢 **위험 낮음 → 최종 CI 통과 시 main에 자동 반영됩니다.** 확인할 필요는 없지만, 아래 '확인 방법'으로 써볼 수 있습니다."
     : risk.level === "high"
-      ? "🟡 **확인 필요 → 아래 '주의할 점'을 보고 머지 여부를 결정해 주세요.**"
-      : "🟡 **계획에서 자동 머지를 꺼 두었습니다 (`auto_merge: false`). 확인 후 머지해 주세요.**";
+      ? "🟡 **확인 필요 → 아래 '주의할 점'을 보고 반영 여부를 결정해 주세요 (PR의 Merge 버튼).**"
+      : "🟡 **계획에서 자동 반영을 꺼 두었습니다 (`auto_merge: false`). 확인 후 반영해 주세요 (PR의 Merge 버튼).**";
   const built = steps.map((s) => `**${s.id}. ${s.title}** (#${s.pr})\n${s.summary ? s.summary.split("\n").map((l) => (l.startsWith("-") ? l : `- ${l}`)).join("\n") : "- (요약 없음)"}`);
   const howTo = plan.try
     ? plan.try
@@ -666,4 +666,60 @@ export function claudeReviewComment({ sha, verdict, summary, findings, runUrl, t
     ...(tools ? ["### 도구 사용 (자동 기록)", tools, ""] : []),
     `[실행 로그](${runUrl})`,
   ].join("\n");
+}
+
+// ---------------------------------------------------------------- final PR sync (final-sync.yml)
+
+const SYNC_RE = /<!-- orch-final-sync:v1 (\{[^<>\n]*\}) -->/;
+const ACTIONS_BOT_ID = 41898282;
+
+export function finalSyncMarker(r) {
+  return `<!-- orch-final-sync:v1 ${JSON.stringify(r).replace(/</g, "\\u003c").replace(/>/g, "\\u003e")} -->`;
+}
+
+/** Latest final-sync result for this head, written by the Actions bot only. */
+export function finalSyncResult(comments, head) {
+  let found = null;
+  for (const c of comments ?? []) {
+    if (c?.user?.id !== ACTIONS_BOT_ID || c?.user?.type !== "Bot") continue;
+    const m = SYNC_RE.exec(c.body ?? "");
+    if (!m) continue;
+    try { const j = JSON.parse(m[1]); if (j.head === head) found = j; } catch { /* ignore */ }
+  }
+  return found;
+}
+
+/** Files whose conflicts final-sync may resolve on its own. Anything else needs a person. */
+export const AUTO_RESOLVE_FILES = ["src/lib/patchnotes.ts"];
+
+/**
+ * Resolve git conflict markers in the patch-notes file: keep both sides' entries, newest version first.
+ * Returns null when it is not safe (same version on both sides, or markers outside entry lines).
+ */
+export function resolvePatchNotes(text) {
+  const lines = text.split("\n");
+  const out = [];
+  const isEntry = (l) => /^\s*\{ version: "\d+\.\d+\.\d+"/.test(l);
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith("<<<<<<< ")) { out.push(lines[i]); continue; }
+    const ours = [], theirs = [];
+    let side = ours;
+    for (i++; i < lines.length && !lines[i].startsWith(">>>>>>> "); i++) {
+      if (lines[i].startsWith("=======")) { side = theirs; continue; }
+      if (lines[i].startsWith("||||||| ")) return null;
+      side.push(lines[i]);
+    }
+    if (i >= lines.length) return null;
+    const both = [...ours, ...theirs];
+    if (!both.every((l) => isEntry(l) || !l.trim())) return null;
+    out.push(...both.filter((l) => l.trim()));
+  }
+  const idx = out.map((l, i) => (isEntry(l) ? i : -1)).filter((i) => i >= 0);
+  const ver = (l) => /version: "(\d+)\.(\d+)\.(\d+)"/.exec(l).slice(1).map(Number);
+  const entries = idx.map((i) => out[i]);
+  const keys = entries.map((l) => ver(l).join("."));
+  if (new Set(keys).size !== keys.length) return null;             // same version added twice: a person decides
+  entries.sort((a, b) => { const x = ver(a), y = ver(b); return y[0] - x[0] || y[1] - x[1] || y[2] - x[2]; });
+  idx.forEach((i, k) => { out[i] = entries[k]; });
+  return out.join("\n");
 }
