@@ -187,18 +187,21 @@ export function reviewRoute(sw, codexUnavailable) {
 
 // ---------------------------------------------------------------- state marker + board
 
-const STATE_RE = /<!-- orch-state:v1 ([\s\S]*?) -->/;
+// The marker JSON is one line with < and > escaped (stateMarker), so it can never span text the PM wrote.
+// A plan that merely mentions the marker (e.g. "<!-- orch-state:v1 --> 마커") does not match; the engine's own
+// marker is appended last, so the last valid match wins.
+const STATE_RE = /<!-- orch-state:v1 (\{[^<>\n]*\}) -->/g;
 const BOARD_RE = /\n*<!-- orch-board:start -->[\s\S]*?<!-- orch-board:end -->\n*/;
 
 export function readState(body) {
-  const m = STATE_RE.exec(body ?? "");
-  if (!m) return null;
-  try {
-    const s = JSON.parse(m[1]);
-    return s && typeof s === "object" && s.v === 1 ? s : null;
-  } catch {
-    return null;
+  let found = null;
+  for (const m of (body ?? "").matchAll(STATE_RE)) {
+    try {
+      const s = JSON.parse(m[1]);
+      if (s && typeof s === "object" && s.v === 1) found = s;
+    } catch { /* not ours */ }
   }
+  return found;
 }
 
 export function stateMarker(state) {

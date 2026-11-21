@@ -114,7 +114,10 @@ function fakeGitHub() {
     if ((m = /^\/commits\/([a-f0-9]+)\/check-runs$/.exec(p))) return json(200, { check_runs: page > 1 ? [] : db.checks[m[1]] ?? [] });
     if (p === "/actions/workflows/claude-work.yml/dispatches") { db.dispatches.push(body.inputs); return json(204); }
     if (p === "/actions/workflows/claude-review.yml/dispatches") { db.reviews.push(body.inputs); return json(204); }
-    if (p === "/actions/workflows/claude-work.yml/runs") return json(200, { workflow_runs: [] });
+    if (p === "/actions/workflows/claude-work.yml/runs") {
+      const status = u.searchParams.get("status");
+      return json(200, { workflow_runs: page > 1 ? [] : (db.workRuns ?? []).filter((w) => !status || w.status === status) });
+    }
     throw new Error(`fake GitHub: unhandled ${method} ${p}`);
   }
   return { db, handler };
@@ -549,4 +552,23 @@ test("switches: Codex OFF routes review to Opus and ignores Codex verdicts; Code
     assert.equal(state(n).held, null);
     assert.match(db.comments[n].at(-1).body, /Codex가 OFF라 Claude\(Opus\) 대체 검수/);
   });
+});
+
+test("watchdog: implement run that ended without pushing (stale state read) is dispatched once more, only once", async () => {
+  const issue = db.newIssue(plan(1));
+  const n = issue.number;
+  await fire("issues", { action: "labeled", label: { name: "orch:go" }, sender: { login: "o" }, issue });
+  const old = new Date(Date.now() - 15 * 60000).toISOString();
+  const st = state(n);
+  db.issues[n].body = db.issues[n].body.replace(C.stateMarker(st), C.stateMarker({ ...st, requestedAt: old }));
+  db.workRuns = [{ status: "completed", display_title: `claude-work #${n} implement step 1`, created_at: old }];
+  const mine = () => db.dispatches.filter((d) => String(d.issue) === String(n)).length;
+  const before = mine();
+  await fire("schedule", {});
+  assert.equal(mine(), before + 1, "dispatched again");
+  assert.ok(state(n).redispatchedAt);
+  db.issues[n].body = db.issues[n].body.replace(C.stateMarker(state(n)), C.stateMarker({ ...state(n), requestedAt: old }));
+  await fire("schedule", {});
+  assert.equal(mine(), before + 1, "not again");
+  db.workRuns = [];
 });
