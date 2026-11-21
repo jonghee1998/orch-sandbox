@@ -193,7 +193,7 @@ async function start(run, sender) {
         await gh().post(`/issues/${pr.number}/comments`, { body: `${C.LOG_MARK}\n재개로 이 스텝을 처음부터 다시 구현하므로 PR을 닫습니다.` });
         await gh().patch(`/pulls/${pr.number}`, { state: "closed" });
       }
-      await save(run, { status: "implementing", attempt: (st.attempt ?? 1) + 1, retries: 0, pr: null, reason: null, requestedAt: now() },
+      await save(run, { status: "implementing", attempt: (st.attempt ?? 1) + 1, retries: 0, pr: null, reason: null, requestedAt: now(), redispatchedAt: null },
         `▶️ 재개: Step ${st.step}을 새로 구현합니다 (시도 ${(st.attempt ?? 1) + 1}).`);
       await dispatchWork(run, "implement");
     }
@@ -323,7 +323,7 @@ async function onPass(run, pr, reviewer = "codex") {
   const total = run.plan.steps.length;
 
   if (step.id < total) {
-    await save(run, { status: "implementing", step: step.id + 1, attempt: 1, retries: 0, pr: null, passed, stepInfo, requestedAt: now() },
+    await save(run, { status: "implementing", step: step.id + 1, attempt: 1, retries: 0, pr: null, passed, stepInfo, requestedAt: now(), redispatchedAt: null },
       `✅ Step ${step.id} 통과 (#${pr.number}, ${reviewNote} + CI 통과) → Step ${step.id + 1} 구현 시작`);
     await dispatchWork(run, "implement");
     return;
@@ -478,6 +478,16 @@ async function watchOne(n) {
       ...(await ro().all("/actions/workflows/claude-work.yml/runs?status=queued")),
     ].some((w) => (w.display_title ?? "").includes(`#${n} `));
     if (!busy && (await recoverPushedWork(run))) return;
+    // Work that finished without pushing anything for this request (e.g. it skipped on a stale read): dispatch once more.
+    if (!busy && !st.redispatchedAt) {
+      const done = await ro().get(`/actions/workflows/claude-work.yml/runs?status=completed&per_page=20`);
+      const mine = (done?.workflow_runs ?? []).find((w) => (w.display_title ?? "").includes(`#${n} implement step ${st.step}`) && Date.parse(w.created_at) >= Date.parse(st.requestedAt) - 60000);
+      if (mine) {
+        await save(run, { redispatchedAt: now() }, `♻️ Step ${st.step} 구현 실행이 결과 없이 끝나 한 번 더 맡깁니다.`);
+        await dispatchWork(run, "implement");
+        return;
+      }
+    }
   }
 
   if (["implementing", "fixing"].includes(st.status) && minutesSince(st.requestedAt) > WORK_IDLE_MIN) {
@@ -565,9 +575,23 @@ function expectedStatus(mode) {
   return mode === "fix" ? "fixing" : "implementing";
 }
 
+/**
+ * The orchestrator saves the Issue state and dispatches work right away; a read that follows immediately can still
+ * see the previous body (GitHub API read-after-write lag). Re-read a few times before deciding the work is stale.
+ */
+async function loadRunExpecting(n, ok, client, tries = Number(env.ORCH_READ_RETRIES ?? 4), waitMs = Number(env.ORCH_READ_WAIT_MS ?? 5000)) {
+  let run = null;
+  for (let i = 0; i < tries; i++) {
+    run = await loadRun(n, client);
+    if (ok(run)) return run;
+    if (i < tries - 1) { log(`state not ready (status=${run?.state?.status}); re-reading in ${waitMs / 1000}s`); await new Promise((r) => setTimeout(r, waitMs)); }
+  }
+  return run;
+}
+
 async function prepare() {
   const n = Number(env.ISSUE), mode = env.MODE, step = Number(env.STEP);
-  const run = await loadRun(n);
+  const run = await loadRunExpecting(n, (r) => r?.plan && r.state?.status === expectedStatus(mode) && r.state.step === step);
   const st = run?.state;
   if (!run?.plan || !st || st.status !== expectedStatus(mode) || st.step !== step) {
     log(`skip: state=${st?.status} step=${st?.step} (expected ${expectedStatus(mode)} step ${step})`);
