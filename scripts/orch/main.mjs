@@ -177,9 +177,13 @@ async function start(run, sender) {
 
   // Resume from blocked
   if (st?.status === "blocked" && st.blockKind === "final") {
-    await save(run, { status: "awaiting_merge", reason: null },
-      `▶️ 자동 반영을 멈추고 사용자 반영 대기로 바꿨습니다. 최종 PR #${st.finalPr}을 확인해 주세요.`);
+    // A low-risk run that only stopped on a main conflict goes back to the automatic path once the conflict is gone.
+    const auto = st.risk === "low" && run.plan.auto_merge !== false && /충돌/.test(st.reason ?? "");
+    await save(run, { status: auto ? "finalizing" : "awaiting_merge", reason: null },
+      auto ? `▶️ 충돌이 풀려 자동 반영 경로로 돌아갑니다. 최종 PR #${st.finalPr}의 CI가 통과하면 반영합니다.`
+        : `▶️ 자동 반영을 멈추고 사용자 반영 대기로 바꿨습니다. 최종 PR #${st.finalPr}을 확인해 주세요.`);
     await setLabels(run.n, [C.LABELS.run], [C.LABELS.blocked]);
+    if (auto) await watchOne(run.n);
     return;
   }
   if (st?.status === "blocked") {
