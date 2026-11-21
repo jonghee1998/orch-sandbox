@@ -28,6 +28,7 @@ jobs:
       changed: ${{ steps.commit.outputs.changed }}
       blocked: ${{ steps.commit.outputs.blocked }}
       summary: ${{ steps.commit.outputs.summary }}
+      tools: ${{ steps.tools.outputs.tools }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,7 +71,12 @@ jobs:
           claude_args: >-
             --max-turns 80
             ${{ steps.prep.outputs.model_args }}
-            --allowedTools "Edit,Write,Read,Glob,Grep,LS,Skill,Task,Agent,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*)"
+            --allowedTools "Edit,Write,Read,Glob,Grep,LS,Skill,Task,Agent,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git rm:*),Bash(git commit:*)"
+      - name: Summarize tool use (skills, sub-agents, verification commands)
+        id: tools
+        if: always() && steps.prep.outputs.skip != 'true'
+        continue-on-error: true
+        run: node "$RUNNER_TEMP/orch/tools.mjs" "$RUNNER_TEMP/claude-execution-output.json"
       - name: Commit and push
         id: commit
         if: steps.prep.outputs.skip != 'true'
@@ -122,6 +128,7 @@ jobs:
           CHANGED: ${{ needs.work.outputs.changed }}
           BLOCKED: ${{ needs.work.outputs.blocked }}
           SUMMARY: ${{ needs.work.outputs.summary }}
+          TOOLS: ${{ needs.work.outputs.tools }}
           ORCH_SONNET: ${{ vars.ORCH_SONNET }}
           ORCH_OPUS: ${{ vars.ORCH_OPUS }}
           ORCH_CODEX: ${{ vars.ORCH_CODEX }}

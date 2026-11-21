@@ -366,6 +366,8 @@ const RULES = (step) => [
   "- 테스트가 있으면 실행해 통과시킨다 (`npm test`). 새 기능에는 테스트를 추가한다.",
   "- `.github/`와 `scripts/orch/`는 수정하지 않는다.",
   "- git push, 브랜치 생성, PR 생성은 하지 않는다. 커밋·푸시·PR은 오케스트레이터가 한다.",
+  "- 파일을 지워야 하면 `git rm <경로>`를 쓴다 (`rm`은 허용되지 않음).",
+  "- 저장소에 `.claude/skills/`·`.claude/agents/`가 있으면 활용한다: 끝내기 전 `verification-loop` 스킬이 있으면 Skill 도구로 실행하고, 빌드·타입 오류는 해당 보조 에이전트(예: `build-error-resolver`)에 Task 도구로 맡길 수 있다. 스킬 지시가 이 규칙과 충돌하면 이 규칙이 우선한다.",
   "- 작업이 끝나면 `.orch/SUMMARY.md`에 다음 형식으로 적는다:",
   "  - `## 변경 요약` 3~5줄",
   "  - `## 완료 기준 확인` done_when 항목별 ✅/❌와 근거(실행한 명령과 결과)",
@@ -408,7 +410,7 @@ export function fixPrompt(plan, stepId, { round, maxRetries, findings, reviewBod
   ].filter(Boolean).join("\n\n");
 }
 
-export function prBody(n, plan, stepId, summary) {
+export function prBody(n, plan, stepId, summary, tools = "") {
   const step = plan.steps.find((s) => s.id === stepId);
   return [
     prMarker(n, stepId),
@@ -416,11 +418,25 @@ export function prBody(n, plan, stepId, summary) {
     "",
     summary?.trim() || "_(Claude가 SUMMARY를 남기지 않았습니다)_",
     "",
+    ...(tools ? ["### 도구 사용 (자동 기록)", tools, ""] : []),
     "---",
     `완료 기준:\n${step.done_when.map((x) => `- ${x}`).join("\n")}`,
     "",
     `_orchestrator가 생성한 스텝 PR입니다. Codex 검증과 CI를 통과하면 \`${runBranch(n)}\`에 자동 머지됩니다._`,
   ].join("\n");
+}
+
+/** ECC usage from a step PR's tool line: "스킬: `a`, `b` | 보조 에이전트: ..." → short cell text. */
+export function eccCell(body) {
+  const line = /^🧰 .*$/m.exec(body ?? "")?.[0];
+  if (!line) return "-";
+  const pick = (label) => {
+    const m = new RegExp(`${label}: ([^|]+)`).exec(line);
+    const v = (m?.[1] ?? "").trim();
+    return v && v !== "없음" ? v.replace(/`/g, "") : "";
+  };
+  const parts = [pick("스킬"), pick("보조 에이전트")].filter(Boolean);
+  return parts.length ? parts.join(" / ") : "없음";
 }
 
 // ---------------------------------------------------------------- final report + risk gate
@@ -480,7 +496,7 @@ export function classifyRisk(files, deps = []) {
 /** Pull the "## 변경 요약" section and any ❌ lines out of a step PR body. */
 export function extractSummary(prBodyText) {
   const body = String(prBodyText ?? "").split(/\n---\n/)[0];
-  const sec = /##\s*변경 요약\s*\n([\s\S]*?)(?=\n##\s|$)/.exec(body);
+  const sec = /##\s*변경 요약\s*\n([\s\S]*?)(?=\n#{2,3}\s|$)/.exec(body);
   const summary = (sec ? sec[1] : "").trim().split("\n").filter(Boolean).slice(0, 6).join("\n");
   const unmet = body.split("\n").filter((l) => l.includes("❌")).map((l) => l.replace(/^\s*[-*]\s*/, "").trim()).slice(0, 5);
   return { summary, unmet };
@@ -509,7 +525,7 @@ export function finalReport({ n, plan, steps, risk, autoMerge }) {
   const howTo = plan.try
     ? plan.try
     : plan.steps.flatMap((s) => s.done_when).map((x) => `- ${x}`).join("\n");
-  const checks = steps.map((s) => `| ${s.id}. ${s.title} | ${s.model ?? "-"} | ${s.reviewer} | ${s.retries}회 | #${s.pr} |`);
+  const checks = steps.map((s) => `| ${s.id}. ${s.title} | ${s.model ?? "-"} | ${s.ecc ?? "-"} | ${s.reviewer} | ${s.retries}회 | #${s.pr} |`);
   const cautions = risk.reasons.length
     ? risk.reasons.map((r) => `- **${r.reason}**: ${r.detail}`).join("\n")
     : "- 없음 (DB·로그인·결제·권한·배포 설정·외부 패키지 변경 없음)";
@@ -527,8 +543,8 @@ export function finalReport({ n, plan, steps, risk, autoMerge }) {
     howTo,
     "",
     "### 검사 결과",
-    "| 스텝 | 구현 모델 | 검사 | 수정 | PR |",
-    "| --- | --- | --- | --- | --- |",
+    "| 스텝 | 구현 모델 | 스킬·보조 에이전트 | 검사 | 수정 | PR |",
+    "| --- | --- | --- | --- | --- | --- |",
     ...checks,
     "",
     "모든 스텝이 독립 검사와 CI(`npm test`)를 통과했습니다.",
