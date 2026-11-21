@@ -45,3 +45,24 @@ test("prBody includes the tool line; summary extraction and ECC cell read it bac
   assert.equal(C.eccCell("no record"), "-");
   assert.doesNotMatch(C.prBody(5, plan, 1, "s"), /도구 사용/);
 });
+
+test("ECC stage 2: review prompt names review agents; verdict comment keeps tools and still parses", () => {
+  const plan = C.validatePlan({ goal: "g", steps: [{ id: 1, title: "t", task: "x", done_when: ["d"] }] }).plan;
+  const p = C.reviewPrompt(plan, 1, "origin/orch/run-1");
+  for (const a of C.REVIEW_AGENTS) assert.match(p, new RegExp("`" + a + "`"));
+  assert.match(p, /최종 판정은 너 자신이 내린다/);
+  const SHA = "a".repeat(40);
+  const ACT = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
+  const tools = "🧰 도구: Task 2 | 스킬: 없음 | 보조 에이전트: `code-reviewer`, `security-reviewer` | 검증 명령: `npm test`";
+  const body = C.claudeReviewComment({ sha: SHA, verdict: "PASS", summary: "ok", findings: [], runUrl: "u", tools });
+  assert.match(body, /### 도구 사용 \(자동 기록\)\n🧰 .*code-reviewer/);
+  assert.equal(C.claudeReviewVerdict([{ user: ACT, body, updated_at: "1" }], SHA).result, "pass");
+  assert.doesNotMatch(C.claudeReviewComment({ sha: SHA, verdict: "PASS", summary: "", findings: [], runUrl: "u" }), /도구 사용/);
+});
+
+test("prBody shows the implementing model when known", () => {
+  const plan = C.validatePlan({ goal: "g", steps: [{ id: 1, title: "t", task: "x", done_when: ["d"] }] }).plan;
+  assert.match(C.prBody(5, plan, 1, "s", "", "opus (검수 2회 실패로 상향)"), /^구현 모델: opus \(검수 2회 실패로 상향\)$/m);
+  assert.doesNotMatch(C.prBody(5, plan, 1, "s"), /구현 모델/);
+  assert.equal(C.extractSummary(C.prBody(5, plan, 1, "## 변경 요약\n- 바꿈", "", "sonnet (자동(일반 작업))")).summary, "- 바꿈");
+});

@@ -31,15 +31,21 @@ jobs:
           ref: ${{ inputs.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Trusted orchestrator scripts (from main)
+      - name: Trusted orchestrator scripts and review agents (from main)
         uses: actions/checkout@v4
         with:
           ref: main
           path: .orch-main
           persist-credentials: false
-          sparse-checkout: scripts/orch
-      - name: Move trusted scripts out of the reviewed tree
-        run: cp -r .orch-main/scripts/orch "$RUNNER_TEMP/orch" && rm -rf .orch-main
+          sparse-checkout: |
+            scripts/orch
+            .claude
+      - name: Move trusted scripts out; review with main's .claude, not the PR's
+        run: |
+          cp -r .orch-main/scripts/orch "$RUNNER_TEMP/orch"
+          rm -rf .claude
+          if [ -d .orch-main/.claude ]; then cp -r .orch-main/.claude .claude; fi
+          rm -rf .orch-main
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -67,7 +73,12 @@ jobs:
           claude_args: >-
             --max-turns 40
             --model opus
-            --allowedTools "Read,Glob,Grep,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(npm test:*),Bash(node:*),Bash(ls:*),Bash(mkdir:*)"
+            --allowedTools "Read,Glob,Grep,Write,Task,Agent,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(npm test:*),Bash(node:*),Bash(ls:*),Bash(mkdir:*)"
+      - name: Summarize tool use (review sub-agents)
+        id: tools
+        if: always() && steps.prep.outputs.skip != 'true'
+        continue-on-error: true
+        run: node "$RUNNER_TEMP/orch/tools.mjs" "$RUNNER_TEMP/claude-execution-output.json"
       - name: Post verdict
         if: always() && steps.prep.outputs.skip != 'true'
         run: node "$RUNNER_TEMP/orch/main.mjs" review-publish
@@ -76,6 +87,7 @@ jobs:
           PR: ${{ inputs.pr }}
           SHA: ${{ inputs.sha }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          TOOLS: ${{ steps.tools.outputs.tools }}
       - name: Wake the orchestrator for this PR
         if: always() && steps.prep.outputs.skip != 'true'
         run: gh workflow run orchestrator.yml --ref main -f pr="$PR" -R "$GITHUB_REPOSITORY"
